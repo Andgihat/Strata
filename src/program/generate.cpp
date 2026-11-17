@@ -3829,7 +3829,7 @@ int main(int argc, char** argv) {
             const char* env_max = std::getenv("STRATA_PREFILL_AUTO_MAX");
             const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5)
                                      : (o.prefill_auto && env_max != nullptr ? std::atoll(env_max) : 8192);
-            o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
+            o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : want_max > 0 ? (int64_t) want_max : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
             {   // #1630: Windows HIP, RX 7900 XTX: a first long prompt at 8192-token chunks charged ~70 GB of commit and
                 // killed the engine; 7500 and below were flat.  A bare auto stops at 6144; a chunk the user names stays.
@@ -10515,7 +10515,7 @@ int main(int argc, char** argv) {
     // context, but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in (#282): a 32K prompt with
     // IQ2_XS (RTX 5090, 64K context) read at 5,624 tok/s in 8192-token chunks and 6,465 in one 32768 chunk (40K
     // -> 18K experts streamed; an NVFP4 pack at 262K: 3,535 -> 5,201).
-    int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
+    int64_t auto_ceiling = std::min<int64_t>(o.prefill_auto_max, o.max_context);
     // 0.1.44: a layer split reads a prompt as a pipeline of chunks (the later card reads chunk c while the first reads c+1), so a
     // 32K prompt in two 16384 chunks fills and drains the pipe for most of its time.  8192 chunks, same tokens: 2x R9700
     // pp32k +14%, 4x +19%, pp64k +4% / +16%.  STRATA_SPLIT_CHUNK16K=1 keeps the gfx12 16384 ceiling on a split.
@@ -10600,8 +10600,7 @@ int main(int argc, char** argv) {
             strata::prefill::Prefill::set_ring_budget(0, 0);
             static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
             for (const int64_t c : kAutoChunks) {
-                // above 8192: only when asked for, and only when a prompt of the context can use it
-                if (c > 8192 && (c > o.prefill_auto_max || c > o.max_context)) continue;
+                if (c > o.prefill_auto_max || c > o.max_context) continue;
                 if (o.prefill_auto_cap > 0 && c > o.prefill_auto_cap) continue;   // #1630
                 const int64_t k = old_slots(c);
                 if (k + g_lend_keep <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) return c;

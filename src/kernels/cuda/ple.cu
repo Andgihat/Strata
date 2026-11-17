@@ -17,6 +17,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/sakura_cp2_table.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -408,6 +409,76 @@ void ple_iq4nl_dequant(const uint8_t* raw, int64_t rows, float* out, void* strea
     const int64_t n = rows * PLE_HEAD_DIM;
     if (n <= 0) return;
     ple_iq4nl_dequant_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(raw, n, out);
+}
+
+namespace {
+__constant__ float kPleCp2Codebook[1024];
+bool g_cp2_codebook_ready[64] = {};
+
+void ensure_cp2_codebook() {
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) dev = 0;
+    if (g_cp2_codebook_ready[dev]) return;
+    const cudaError_t e = cudaMemcpyToSymbol(kPleCp2Codebook, kSakuraCp2Codebook, sizeof(kSakuraCp2Codebook));
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "ple: cudaMemcpyToSymbol(kPleCp2Codebook) failed: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    g_cp2_codebook_ready[dev] = true;
+}
+
+__global__ void ple_cp2_dequant_kernel(const uint8_t* __restrict__ raw, int64_t total_pairs, float2* __restrict__ out) {
+    const int64_t p = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= total_pairs) return;
+
+    const int64_t r = p / 80;
+    const int r10 = (int)(p - r * 80);
+    const uint8_t* row = raw + r * PLE_ROW_BYTES_CP2;
+
+    const uint16_t b40 = row[40];
+    const uint16_t b41 = row[41];
+    const uint32_t scale_u32 = ((uint32_t)(b40 | (b41 << 8))) << 16;
+    if (scale_u32 == 0) {
+        out[p] = make_float2(0.0f, 0.0f);
+        return;
+    }
+    const float row_scale = __uint_as_float(scale_u32);
+
+    const int k0 = (r10 >= 3) ? (r10 - 3) : (r10 + 77);
+    const int k1 = (r10 >= 2) ? (r10 - 2) : (r10 + 78);
+    const int k2 = (r10 >= 1) ? (r10 - 1) : (r10 + 79);
+    const int k3 = r10;
+
+    auto get_nib = [](const uint8_t* rw, int k) -> uint32_t {
+        const uint8_t b = rw[k >> 1];
+        return (k & 1) ? (b >> 4) : (b & 0x0F);
+    };
+
+    const uint32_t code = (get_nib(row, k0) << 12) |
+                          (get_nib(row, k1) << 8)  |
+                          (get_nib(row, k2) << 4)  |
+                          (get_nib(row, k3));
+
+    const uint32_t ecx = code * (code + 1);
+    const uint32_t code_idx = (ecx >> 6) & 0x1ff;
+    float v0 = kPleCp2Codebook[2 * code_idx];
+    const float v1 = kPleCp2Codebook[2 * code_idx + 1];
+    if ((ecx >> 15) & 1) {
+        v0 = -v0;
+    }
+
+    out[p] = make_float2(v0 * row_scale, v1 * row_scale);
+}
+}  // namespace
+
+void ple_cp2_dequant(const uint8_t* raw, int64_t rows, float* out, void* stream) {
+    if (rows <= 0) return;
+    ensure_cp2_codebook();
+    const int64_t total_pairs = rows * 80;
+    const int block_size = 256;
+    const unsigned grid_size = (unsigned)((total_pairs + block_size - 1) / block_size);
+    ple_cp2_dequant_kernel<<<grid_size, block_size, 0, (cudaStream_t)stream>>>(raw, total_pairs, (float2*)out);
 }
 
 }  // namespace strata::kernels

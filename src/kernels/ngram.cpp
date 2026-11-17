@@ -21,6 +21,7 @@
 #include <sys/resource.h>
 #endif
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -197,34 +198,56 @@ void nvfp4_row_dequant(const uint8_t* row, float scale, float* out160) {
 
 // Sakura CP2 table: 42-byte row (40 bytes of 80 trellis nibbles + 2 bytes BF16 scale).
 // 160 values decoded in 80 pairs via 512-entry 2D codebook (sakura_cp2_160_v1).
+namespace {
+struct SakuraCp2LutPair {
+    float v0;
+    float v1;
+};
+
+// 65536 precomputed code pairs (512 KB, permanently resident in CPU L2 cache)
+alignas(64) static const auto kSakuraCp2LUT = [] {
+    std::array<SakuraCp2LutPair, 65536> lut{};
+    for (uint32_t code = 0; code < 65536; ++code) {
+        uint32_t ecx = code * (code + 1);
+        uint32_t code_idx = (ecx >> 6) & 0x1ff;
+        float v0 = kSakuraCp2Codebook[2 * code_idx];
+        float v1 = kSakuraCp2Codebook[2 * code_idx + 1];
+        if ((ecx >> 15) & 1) {
+            v0 = -v0;
+        }
+        lut[code] = {v0, v1};
+    }
+    return lut;
+}();
+}  // namespace
+
 void cp2_dequant_row(const uint8_t* row, float /*scale*/, float* out160) {
     const uint16_t b40 = row[40];
     const uint16_t b41 = row[41];
     const uint32_t scale_u32 = (uint32_t)(b40 | (b41 << 8)) << 16;
+    if (scale_u32 == 0) {
+        std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+        return;
+    }
     float row_scale;
     std::memcpy(&row_scale, &scale_u32, sizeof(float));
 
+    // Direct nibble extraction into a contiguous buffer (no idiv/modulo in inner loop)
+    uint8_t nibs[80];
+    for (int i = 0; i < 40; ++i) {
+        uint8_t b = row[i];
+        nibs[i * 2]     = b & 0x0F;
+        nibs[i * 2 + 1] = b >> 4;
+    }
+
+    // Cyclic sliding window: seed with wrap-around nibbles 77, 78, 79
+    uint32_t code = ((uint32_t)nibs[77] << 8) | ((uint32_t)nibs[78] << 4) | (uint32_t)nibs[79];
+
     for (int r10 = 0; r10 < 80; ++r10) {
-        uint16_t code = 0;
-        for (int step = 0; step < 4; ++step) {
-            const int rem80 = (r10 + 77 + step) % 80;
-            const uint8_t b = row[rem80 >> 1];
-            const uint8_t nib = (rem80 & 1) ? (b >> 4) : (b & 0x0F);
-            code = (code << 4) | nib;
-        }
-
-        const uint32_t ecx = (uint32_t)code * ((uint32_t)code + 1);
-        const uint32_t code_idx = (ecx >> 6) & 0x1ff;
-
-        float v0 = kSakuraCp2Codebook[2 * code_idx];
-        float v1 = kSakuraCp2Codebook[2 * code_idx + 1];
-
-        if ((ecx >> 15) & 1) {
-            v0 = -v0;
-        }
-
-        out160[2 * r10]     = v0 * row_scale;
-        out160[2 * r10 + 1] = v1 * row_scale;
+        code = ((code & 0x0FFF) << 4) | nibs[r10];
+        const SakuraCp2LutPair& p = kSakuraCp2LUT[code];
+        out160[2 * r10]     = p.v0 * row_scale;
+        out160[2 * r10 + 1] = p.v1 * row_scale;
     }
 }
 
@@ -616,6 +639,8 @@ bool PleTable::unlock() {
     return true;
 }
 const char* PleTable::format() const { return impl_->fmt->name; }
+PleFormat PleTable::format_id() const { return impl_->fmt->id; }
+uint32_t PleTable::row_bytes() const { return impl_->rb; }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::table_bytes() const { return impl_->n_rows * (uint64_t) impl_->rb; }
@@ -778,24 +803,79 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     return true;
 }
 
-bool PleTable::gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const {
+bool PleTable::gather_raw(const uint32_t* rows, size_t n_tokens, uint8_t* out, std::string& err) {
     std::lock_guard<std::recursive_mutex> lk(impl_->mu);
-    if (impl_->data == nullptr || impl_->fmt->id != PleFormat::IQ4_NL || impl_->rb != PLE_ROW_BYTES) return false;
-    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
-    for (size_t i = 0; i < n; ++i) {
-        uint8_t* o = out + i * PLE_ROW_BYTES;
-        if (rows[i] >= impl_->n_rows) {
-            // a row past the table reads as +0.0f (read_row): scale 0 and code 8 (value +1) in every nibble decode to +0.0f
-            // on the device, where all-zero bytes would decode to -0.0f (scale 0 times code 0's value -127)
-            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
-                uint8_t* blk = o + (size_t) b * 18;
-                std::memset(blk, 0, 2);
-                std::memset(blk + 2, 0x88, 16);
-            }
-        } else std::memcpy(o, impl_->data + (size_t) rows[i] * PLE_ROW_BYTES, PLE_ROW_BYTES);
+    if (impl_->pending) { err = "PleTable::gather_raw while a token is in flight"; return false; }
+    const PleFormat fmt = impl_->fmt->id;
+    if (fmt != PleFormat::IQ4_NL && fmt != PleFormat::CP2) {
+        err = "PleTable::gather_raw: format not supported for compact raw upload";
+        return false;
     }
-    impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    const uint32_t rb = impl_->rb;
+
+    if (impl_->mode == PleIo::Direct) {
+        wait_prefetches();
+        const auto ticket = impl_->reader.issue(rows, n, out);
+        if (!impl_->reader.collect(ticket, err)) return false;
+        impl_->bytes_read += (uint64_t) n * rb;
+        return true;
+    }
+
+    if (impl_->data == nullptr) {
+        err = "PleTable::gather_raw: table not open";
+        return false;
+    }
+
+    constexpr size_t kWin = 4096;
+    auto hint = [&](size_t a, size_t b) {
+        if (impl_->data == nullptr || !g_ple_prefetch) return;
+#if defined(_WIN32)
+        WIN32_MEMORY_RANGE_ENTRY ranges[kWin];
+        ULONG_PTR k = 0;
+        for (size_t i = a; i < b; ++i) {
+            if (rows[i] >= impl_->n_rows) continue;
+            ranges[k].VirtualAddress = (PVOID) (impl_->data + (size_t) rows[i] * rb);
+            ranges[k].NumberOfBytes = rb;
+            ++k;
+        }
+        if (k > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), k, ranges, 0);
+#else
+        for (size_t i = a; i < b; ++i) {
+            if (rows[i] >= impl_->n_rows) continue;
+            const uintptr_t r0 = (uintptr_t) (impl_->data + (size_t) rows[i] * rb);
+            const uintptr_t p0 = r0 & ~(uintptr_t) 4095;
+            (void) madvise((void*) p0, (size_t) (r0 + rb - p0), MADV_WILLNEED);
+        }
+#endif
+    };
+    hint(0, std::min(n, kWin));
+
+    for (size_t i = 0; i < n; ++i) {
+        if ((i % kWin) == 0 && i + kWin < n) hint(i + kWin, std::min(n, i + 2 * kWin));
+        uint8_t* o = out + i * rb;
+        if (rows[i] >= impl_->n_rows) {
+            if (fmt == PleFormat::IQ4_NL) {
+                for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+                    uint8_t* blk = o + (size_t) b * 18;
+                    std::memset(blk, 0, 2);
+                    std::memset(blk + 2, 0x88, 16);
+                }
+            } else if (fmt == PleFormat::CP2) {
+                std::memset(o, 0, PLE_ROW_BYTES_CP2);
+            }
+        } else {
+            std::memcpy(o, impl_->data + (size_t) rows[i] * rb, rb);
+        }
+    }
+    impl_->bytes_read += (uint64_t) n * rb;
     return true;
+}
+
+bool PleTable::gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const {
+    if (impl_->fmt->id != PleFormat::IQ4_NL || impl_->data == nullptr) return false;
+    std::string err;
+    return const_cast<PleTable*>(this)->gather_raw(rows, n_tokens, out, err);
 }
 
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }

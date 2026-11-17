@@ -202,9 +202,10 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
-    /// STRATA_PLE_COMPACT: the same rows as their raw IQ4_NL bytes (n_tokens x 16 rows of PLE_ROW_BYTES; a row past the
-    /// table: scale 0 and code 8 everywhere, which decode to the +0.0f gather_batch writes) for ple_iq4nl_dequant on the device.  False (nothing
-    /// written) unless the table is in memory (--ple-io ram / mmap) and IQ4_NL.
+    /// STRATA_PLE_COMPACT: the same rows as their raw bytes (n_tokens x 16 rows of row_bytes(); a row past the
+    /// table: neutral zeros/code 8) for ple_iq4nl_dequant or ple_cp2_dequant on the device.
+    /// Works with both Mmap/RAM and Direct I/O modes.
+    bool gather_raw(const uint32_t* rows, size_t n_tokens, uint8_t* out, std::string& err);
     bool gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const;
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
@@ -230,6 +231,8 @@ public:
     uint64_t table_bytes() const;
     /// "IQ4_NL" or "F8_E4M3" (a GGUF from tools/ple_fp8_pack.py: type I8, strata.ple.format = f8_e4m3).
     const char* format() const;
+    PleFormat format_id() const;
+    uint32_t row_bytes() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values
     /// occupy `out[h*160, (h+1)*160)`, which is what `ggml_get_rows` does and what makes the result a plain

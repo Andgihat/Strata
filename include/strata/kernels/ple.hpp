@@ -125,8 +125,12 @@ void ple_history_advance(float* hist, const float* normalized, void* stream);
 /// Whether the CUDA path is available.  The host hash and the table read work without it; the block does not.
 bool ple_block_available();
 
-/// STRATA_PLE_COMPACT: `rows` raw IQ4_NL PLE rows (PleTable::gather_raw_iq4nl, PLE_ROW_BYTES each) to 160 floats each,
+/// STRATA_PLE_COMPACT: `rows` raw IQ4_NL PLE rows (PleTable::gather_raw, PLE_ROW_BYTES each) to 160 floats each,
 /// the floats iq4nl_dequant_row writes (d times the code's value, one multiply), on `stream`.
 void ple_iq4nl_dequant(const uint8_t* raw, int64_t rows, float* out, void* stream);
+
+/// STRATA_PLE_COMPACT: `rows` raw CP2 PLE rows (PleTable::gather_raw, PLE_ROW_BYTES_CP2 each) to 160 floats each,
+/// the floats cp2_dequant_row writes (trellis codebook lookup times BF16 scale), on `stream`.
+void ple_cp2_dequant(const uint8_t* raw, int64_t rows, float* out, void* stream);
 
 }  // namespace strata::kernels

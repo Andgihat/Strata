@@ -2526,8 +2526,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
+        const size_t ple_rb = ss.ple.table ? ss.ple.table->row_bytes() : (size_t) strata::kernels::PLE_ROW_BYTES;
+        const size_t ple_alloc_rb = std::max<size_t>(ple_rb, (size_t) strata::kernels::PLE_ROW_BYTES);
         if (ple_compact_on() && m.ple_raw_dev == nullptr &&
-            cudaMalloc((void**) &m.ple_raw_dev, (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES) != cudaSuccess) {
+            cudaMalloc((void**) &m.ple_raw_dev, (size_t) T * strata::kernels::PLE_N_HEADS * ple_alloc_rb) != cudaSuccess) {
             m.ple_raw_dev = nullptr;
             (void) cudaGetLastError();
         }
@@ -4112,10 +4114,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pv[0] = pv[1];
             pv[1] = tok;
         }
-        // STRATA_PLE_COMPACT=1: the raw rows (1,440 bytes a token instead of 10,240 floats' bytes) into the same pinned
+        // STRATA_PLE_COMPACT=1: the raw rows (1,440 bytes a token for IQ4_NL, 672 bytes for CP2) into the same pinned
         // buffer; ple_land uploads them and dequantizes on the device
-        if (ple_compact_on() && m.ple_pageable[buf].empty() && m.ple_raw_dev != nullptr &&
-            ss.ple.table->gather_raw_iq4nl(m.ple_rows[buf].data(), (size_t) T, (uint8_t*) m.ple_emb_host[buf])) {
+        const auto ple_fmt = ss.ple.table ? ss.ple.table->format_id() : strata::kernels::PleFormat::IQ4_NL;
+        const bool ple_can_compact = (ple_fmt == strata::kernels::PleFormat::IQ4_NL || ple_fmt == strata::kernels::PleFormat::CP2);
+        if (ple_compact_on() && ple_can_compact && m.ple_raw_dev != nullptr &&
+            ss.ple.table->gather_raw(m.ple_rows[buf].data(), (size_t) T, (uint8_t*) m.ple_emb_host[buf], e)) {
             m.ple_compact[buf] = true;
             return true;
         }
@@ -4303,16 +4307,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             // #1996: the pageable fallback (no RAM to pin) goes up through a pinned slot; the pinned buffers as before
-            const size_t raw_bytes = (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES;
+            const size_t ple_rb = ss.ple.table ? ss.ple.table->row_bytes() : (size_t) strata::kernels::PLE_ROW_BYTES;
+            const size_t raw_bytes = (size_t) T * strata::kernels::PLE_N_HEADS * ple_rb;
             // STRATA_PLE_COPY_STREAM: the raw rows go up on their own stream once the previous chunk's dequant has read
             // the buffer (ple_raw_free), and the compute stream waits for them (ple_copied) only at the dequant - the
             // DMA overlaps layer 0 instead of idling the compute queue.  ple_copied still marks that buffer's upload
             // done, on whichever stream ran it, for the host-side reuse guard below.
-            const bool ple_side = m.ple_compact[ple_buf] && m.ple_copy != nullptr;
+            const bool ple_side = m.ple_compact[ple_buf] && m.ple_copy != nullptr && m.ple_pageable[ple_buf].empty();
             const cudaStream_t ple_up = ple_side ? m.ple_copy : m.cs;
             if ((ple_side && cudaStreamWaitEvent(m.ple_copy, m.ple_raw_free, 0) != cudaSuccess) ||
                 (m.ple_compact[ple_buf]
-                     ? cudaMemcpyAsync(m.ple_raw_dev, m.ple_emb_host[ple_buf], raw_bytes, cudaMemcpyHostToDevice, ple_up)
+                     ? (m.ple_pageable[ple_buf].empty()
+                            ? cudaMemcpyAsync(m.ple_raw_dev, m.ple_emb_host[ple_buf], raw_bytes, cudaMemcpyHostToDevice, ple_up)
+                            : m.up_ring.h2d(m.ple_raw_dev, m.ple_emb_host[ple_buf], raw_bytes, m.cs))
                      : m.ple_pageable[ple_buf].empty()
                      ? cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs)
                      : m.up_ring.h2d(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs)) !=
@@ -4323,7 +4330,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             if (m.ple_compact[ple_buf]) {
-                strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
+                if (ss.ple.table && ss.ple.table->format_id() == strata::kernels::PleFormat::CP2) {
+                    strata::kernels::ple_cp2_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
+                } else {
+                    strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
+                }
                 if (ple_side && cudaEventRecord(m.ple_raw_free, m.cs) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
