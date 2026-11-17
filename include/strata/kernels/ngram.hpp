@@ -53,13 +53,14 @@ inline constexpr int PLE_ROW_BYTES_Q5_1 = (PLE_HEAD_DIM / 32) * 24;     // 120: 
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;     // 170: a Q8_0 row (UD-Q6_K_XL, Swift-1.5 Q4_K_L)
 inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;             // 320: a BF16 row, two bytes a value
 inline constexpr int PLE_ROW_BYTES_NVFP4 = PLE_HEAD_DIM / 2 + PLE_HEAD_DIM / 16;   // 90: 80 B of E2M1 codes + 10 E4M3 block scales
+inline constexpr int PLE_ROW_BYTES_CP2 = 42;                             // 42: Sakura CP2 (40 B trellis codes + 2 B BF16 scale)
 inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;             // the widest row any format in `ple_formats()` has
 
 /// THE FORMATS OF THE TABLE, ONE ROW EACH. A table type is one entry here (its GGUF type name, the bytes of one
 /// 160-value row, how to turn a row into floats) and nothing else: `PleTable::open`, `format()`, the reader's row size,
 /// the error string and the buffers' size all read this list, so a new format cannot be in one switch and missing from
 /// another. A row is always `PLE_HEAD_DIM` = 160 values = 5 blocks of 32 for the block formats.
-enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16, NVFP4 };
+enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16, NVFP4, CP2 };
 
 struct PleFormatInfo {
     PleFormat id;
@@ -147,6 +148,10 @@ void fp8_e4m3_dequant_row(const uint8_t* row, float scale, float* out160);
 /// `...ngram_embedding.shard_k` as BF16 (2 B a value, 102.4 GB), the source of record rather than a re-quantization.
 /// There is no scale, because BF16 values are the values.
 void bf16_dequant_row(const uint8_t* row, float* out160);
+
+/// One CP2 row -> 160 floats: 42 bytes (40 bytes trellis nibbles + 2 bytes BF16 scale).
+/// Matches the sakura_cp2_160_v1 trellis codebook dequantizer.
+void cp2_dequant_row(const uint8_t* row, float scale, float* out160);
 
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the

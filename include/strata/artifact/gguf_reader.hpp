@@ -125,7 +125,7 @@ inline const char* ggml_type_name(uint32_t t) {
     case 146:
         return "TQK7";
     case 147:
-        return "TQP5";
+        return "CP2";
     case 148:
         return "TQP6";
     case 149:
@@ -258,9 +258,9 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 128;
         bytes = 30;
         return true;
-    // Gyro-L pair trellis: 128 values = fp16 scale + 64 steps of K bits, 2 weights per step (8*K bytes)
+    // Sakura CP2 / TQP5: 160 values = 40 bytes 2-bit trellis codes + 2 bytes BF16 scale (42 bytes/row)
     case 147:
-        elems = 128;
+        elems = 160;
         bytes = 42;
         return true;
     case 148:

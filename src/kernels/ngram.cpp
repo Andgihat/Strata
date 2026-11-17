@@ -5,6 +5,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/sakura_cp2_table.hpp"
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/memory.hpp"
 
@@ -194,6 +195,39 @@ void nvfp4_row_dequant(const uint8_t* row, float scale, float* out160) {
     }
 }
 
+// Sakura CP2 table: 42-byte row (40 bytes of 80 trellis nibbles + 2 bytes BF16 scale).
+// 160 values decoded in 80 pairs via 512-entry 2D codebook (sakura_cp2_160_v1).
+void cp2_dequant_row(const uint8_t* row, float /*scale*/, float* out160) {
+    const uint16_t b40 = row[40];
+    const uint16_t b41 = row[41];
+    const uint32_t scale_u32 = (uint32_t)(b40 | (b41 << 8)) << 16;
+    float row_scale;
+    std::memcpy(&row_scale, &scale_u32, sizeof(float));
+
+    for (int r10 = 0; r10 < 80; ++r10) {
+        uint16_t code = 0;
+        for (int step = 0; step < 4; ++step) {
+            const int rem80 = (r10 + 77 + step) % 80;
+            const uint8_t b = row[rem80 >> 1];
+            const uint8_t nib = (rem80 & 1) ? (b >> 4) : (b & 0x0F);
+            code = (code << 4) | nib;
+        }
+
+        const uint32_t ecx = (uint32_t)code * ((uint32_t)code + 1);
+        const uint32_t code_idx = (ecx >> 6) & 0x1ff;
+
+        float v0 = kSakuraCp2Codebook[2 * code_idx];
+        float v1 = kSakuraCp2Codebook[2 * code_idx + 1];
+
+        if ((ecx >> 15) & 1) {
+            v0 = -v0;
+        }
+
+        out160[2 * r10]     = v0 * row_scale;
+        out160[2 * r10 + 1] = v1 * row_scale;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // THE FORMAT TABLE (see PleFormatInfo). One entry per table type; the block formats decode 5 blocks of 32.
 namespace {
@@ -205,6 +239,7 @@ void dequant_iq4_nl(const uint8_t* row, float, float* out160) { iq4nl_dequant_ro
 void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequant_row(row, scale, out160); }
 void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
 void dequant_nvfp4(const uint8_t* row, float scale, float* out160) { nvfp4_row_dequant(row, scale, out160); }
+void dequant_cp2(const uint8_t* row, float scale, float* out160) { cp2_dequant_row(row, scale, out160); }
 
 const PleFormatInfo kPleFormats[] = {
     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
@@ -221,6 +256,8 @@ const PleFormatInfo kPleFormats[] = {
     // NVFP4 x16 (NVIDIA's Qwen3.8-Flash-Next-FP4-Local, tools/nvfp4_local_pack.py ple): 90-byte rows, I8 bytes marked
     // strata.ple.format = nvfp4x16 with strata.ple.scale. The tensor is [90, rows]: ne0 is the row's byte count.
     {PleFormat::NVFP4, "NVFP4", "I8", PLE_ROW_BYTES_NVFP4, true, dequant_nvfp4},
+    // Sakura CP2: 42-byte rows (40 B trellis codes + 2 B BF16 scale), 160 elements.
+    {PleFormat::CP2, "CP2", "CP2", PLE_ROW_BYTES_CP2, false, dequant_cp2},
 };
 constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
 }  // namespace
@@ -229,8 +266,14 @@ const PleFormatInfo* ple_formats() { return kPleFormats; }
 int ple_format_count() { return kPleFormatCount; }
 const PleFormatInfo& ple_format_info(PleFormat f) { return kPleFormats[(int) f]; }
 const PleFormatInfo* ple_format_for_type(const char* gguf_type_name) {
-    for (const PleFormatInfo& f : kPleFormats)
+    for (const PleFormatInfo& f : kPleFormats) {
         if (std::strcmp(f.gguf_type, gguf_type_name) == 0) return &f;
+        if (f.id == PleFormat::CP2 && (std::strcmp(gguf_type_name, "TQ2_0") == 0 ||
+                                       std::strcmp(gguf_type_name, "sakura_cp2_160_v1") == 0 ||
+                                       std::strcmp(gguf_type_name, "TQP5") == 0)) {
+            return &f;
+        }
+    }
     return nullptr;
 }
 std::string ple_format_list() {

@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -126,7 +127,7 @@ void bf16_widening_is_exact() {
 /// and the type lookup all have to be right for every format, not only for IQ4_NL.
 uint32_t gguf_type_id(const char* name) {
     static const struct { const char* name; uint32_t id; } ids[] = {
-        {"IQ4_NL", 20}, {"Q4_0", 2}, {"Q4_1", 3}, {"Q5_0", 6}, {"Q5_1", 7}, {"Q8_0", 8}, {"BF16", 30}, {"F8_E4M3", 24}, {"NVFP4", 24}};
+        {"IQ4_NL", 20}, {"Q4_0", 2}, {"Q4_1", 3}, {"Q5_0", 6}, {"Q5_1", 7}, {"Q8_0", 8}, {"BF16", 30}, {"F8_E4M3", 24}, {"NVFP4", 24}, {"CP2", 147}};
     for (const auto& e : ids)
         if (std::strcmp(e.name, name) == 0) return e.id;
     return 0xFFFFFFFFu;
@@ -458,7 +459,30 @@ void table_is_consistent_under_concurrent_use(const std::string& dir) {
     if (g_fail == 0) std::printf("ple table shared by a prompt thread, a decode window and a single gather, 9 reader configurations, vs the mapped reader: OK\n");
 }
 
+void cp2_exact_parity_check() {
+    // Exact byte payload of real Sakura CP2 row 6746895:
+    static const uint8_t kRowBytes[42] = {
+        0xc1, 0xde, 0x7f, 0x54, 0x1d, 0xbe, 0xa1, 0x3f, 0x34, 0xd1, 0x92, 0xc0, 0xcf, 0xdc, 0x68, 0xd8,
+        0x28, 0x01, 0x4c, 0xbe, 0x70, 0x82, 0x21, 0xf2, 0x69, 0x77, 0x95, 0x1d, 0x50, 0x6a, 0x2e, 0x63,
+        0xcc, 0x22, 0xfe, 0x8c, 0x12, 0x3c, 0x0a, 0x37, 0x5d, 0xb2
+    };
+    float out[k::PLE_HEAD_DIM] = {};
+    k::cp2_dequant_row(kRowBytes, 1.0f, out);
+
+    // Verify first 4 decoded float values match the Sakura runtime reference:
+    const float ref0 = -2.374735022514507e-08f;
+    const float ref1 = -1.8733925417901975e-08f;
+    const float ref2 = -2.7555774162468794e-08f;
+    const float ref3 = -1.659868429336464e-09f;
+
+    CHECK(std::fabs(out[0] - ref0) < 1e-13f, "cp2 parity check elem 0 mismatch");
+    CHECK(std::fabs(out[1] - ref1) < 1e-13f, "cp2 parity check elem 1 mismatch");
+    CHECK(std::fabs(out[2] - ref2) < 1e-13f, "cp2 parity check elem 2 mismatch");
+    CHECK(std::fabs(out[3] - ref3) < 1e-13f, "cp2 parity check elem 3 mismatch");
+}
+
 void all_formats_round_trip(const std::string& dir) {
+    cp2_exact_parity_check();
     bf16_widening_is_exact();                      // BF16's own claim: a shift, exact for every pattern
     bad_sizes_are_refused(dir);
     prefetched_keys_are_reused(dir);
