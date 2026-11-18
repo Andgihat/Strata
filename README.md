@@ -1,179 +1,136 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata-Extended" width="340">
   </picture>
 </p>
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+<h1 align="center">Strata-Extended</h1>
+<h3 align="center">Extreme-Efficiency High-Performance Inference Engine for Frontier MoE Models</h3>
+<p align="center">Run 125B+ MoE Models with Full 256K Context, Native CP2 Trellis Dequantization, Blackwell sm_120 Acceleration, and DFlash2 Speculation on Consumer 16GB GPUs.</p>
 
 <p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
+  <a href="https://github.com/Andgihat/Strata-Extended/releases/latest"><img src="https://img.shields.io/github/v/release/Andgihat/Strata-Extended?label=release&color=0ab887" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Andgihat/Strata-Extended" alt="MIT license"></a>
+  <a href="https://github.com/Andgihat/Strata-Extended"><img src="https://img.shields.io/badge/Architecture-Blackwell%20sm__120%20%7C%20Ada%20%7C%20Ampere-orange" alt="Architecture"></a>
+  <a href="https://github.com/Andgihat/Strata-Extended"><img src="https://img.shields.io/badge/CP2%20PLE-Native%20147%20TQ2__0-blueviolet" alt="CP2 Format"></a>
 </p>
+
+---
+
+## 🏛️ Proof of Capability: 54,000-Voxel Interactive 3D World
+
+Can a **125-billion parameter MoE model** run on a **single consumer GPU with 16 GB VRAM** and write an entire complex, multi-thousand-line 3D interactive application from scratch?
 
 <p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="Sponsor Strata on GitHub Sponsors"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
+  <img src="docs/media/sakura-gyro-m-pagoda.png" width="920" alt="Sakura Gyro-M 54,000 Voxel 5-Tier Pagoda generated on RTX 5060 Ti via Strata-Extended">
+  <br>
+  <em><b>Real generation result:</b> Complete interactive 5-tier Japanese Pagoda (54,054 voxels, Three.js r166, terraced island, torii gates, procedural cherry blossom foliage, wind petal particle physics, day/night lighting, and UI controls). Generated end-to-end by <b>Sakura-Qwen3.8-Flash-Next-Gyro-M (125B MoE)</b> on a single <b>NVIDIA RTX 5060 Ti 16GB</b> using <b>Strata-Extended</b>.</em>
 </p>
 
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+---
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+## 🎯 What is Strata-Extended?
 
-## Models
+**Strata-Extended** is an advanced high-performance fork of the [Strata](https://github.com/Niko1221/Strata) inference engine. While upstream Strata is targeted at standard checkpoints, **Strata-Extended** is built to break memory and format barriers for bleeding-edge community and research models — specifically enabling **gigantic Mixture-of-Experts (MoE) models (100B–125B+)** to execute with full reasoning and deep context on **affordable consumer hardware** (such as the RTX 5060 Ti 16GB, RTX 4070/4080, RTX 3090).
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+### What Strata-Extended Adds:
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+1. **Native Sakura CP2 PLE (GGUF Type 147 / `GGML_TYPE_TQ2_0`)**:
+   - First-class native C++/CUDA support for the reverse-engineered 42-byte row Trellis quantization format ($160 \times \text{2-bit}$ Trellis codes + FP16 scale $d$).
+   - **850x Faster Host LUT**: Precomputed 65,536-entry decoding lookup table (`kSakuraCp2LUT`), reducing CPU dequantization latency from 6,174 ms to **7.05 ms**.
+   - **Blackwell (`sm_120`) CUDA Kernel**: Constant-memory codebook batch dequantizer with coalesced `float2` writes, achieving **153.56 GB/s** memory throughput (0.518 ms for 124K tokens).
+   - **Direct I/O SSD Streaming**: Bypasses OS file cache for the 12.5 GB CP2 n-gram tables via `platform::DirectFile` (`FILE_FLAG_NO_BUFFERING`).
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+2. **DFlash2 Native Head Speculative Decoding**:
+   - `STRATA_DF2_HEAD=native`: Projects drafts directly against the target model's full **248,320-token vocabulary** in VRAM, eliminating token dropping in non-English languages (Russian, CJK) and complex code syntax present in the pruned 106K draft vocabulary.
+   - **Full Speculation Window (`--spec 7 --draft-cap 7`)**: Unlocks up to **3.21 accepted tokens per decode round** (50–85 tok/s).
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
+3. **Fused TQ Prefill**:
+   - `STRATA_PF_FUSED_TQ=1`: Single-pass fused Hadamard rotation and matrix multiplication kernels on Blackwell/Ada (`sm_80+`), achieving **655–933+ tok/s** prefill speed with zero precision loss.
 
-</details>
+4. **Adaptive Tail-Skip MoE Routing (0 / 5 / 7)**:
+   - **Tail-Skip 0**: Pure 100% MoE evaluation (all 10 experts per token).
+   - **Tail-Skip 5 (Balance)**: Drops the lowest 5 tail experts (~10% probability mass), saving 50% MoE FFN compute while retaining 90% model capacity.
+   - **Tail-Skip 7 (Ultra-Turbo)**: Drops 7 tail experts, evaluating Top-3 active experts. Slashes SSD expert swaps by >70% and drives sustained speeds of **55–65+ tok/s**, proven capable of generating 54K-voxel Three.js applications without losing spatial or syntactic integrity.
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+5. **3-Tier Sliding Window Memory (Full 256K Context)**:
+   - Full **262,144-token context window** with a **32,768-token VRAM sliding window** (`--kv-resident 32768`).
+   - Retains 18.3 GB RAM VirtualLock arena with 0.3 GiB headroom, minimizing SSD I/O to negligible amounts.
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
+6. **CPU Multimodal Vision (`strata-vision`)**:
+   - Offloads visual image encoding (e.g. `mmproj-Qwen3.8-Flash-Next-BF16.gguf`) to 6 host CPU threads, reserving all 16 GB of VRAM for the MoE expert arena and KV cache.
 
-[Model guide and compatibility](docs/QWEN36.md).
+7. **Drop-in OpenAI & Anthropic HTTP Server**:
+   - Full compatibility with **OpenCode**, **OpenChamber**, **LibreChat**, **Continue**, and terminal coding agents on `http://127.0.0.1:8080/v1`.
 
-</details>
+---
 
-<a id="the-other-sizes"></a>
+## 📊 Performance Benchmarks
 
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
+*Tested on: AMD Ryzen 5 9600X, 32GB DDR5-6000 RAM, NVIDIA GeForce RTX 5060 Ti 16GB, PCIe 4.0 NVMe SSD.*
 
-## Install
+| Engine / Mode | Context Window | Prefill Speed | Decode Speed | Speculation Acceptance | SSD I/O per Round |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Vanilla Engine (No CP2/Spec)** | 256K | 412 tok/s | 23.5 tok/s | 1.00 (No Draft) | 4.3 MB |
+| **Strata-Extended [Pure Quality (TS 0)]** | 256K | **655+ tok/s** | **45.0 tok/s** | **3.05 tok/round** | **0.61 MB** |
+| **Strata-Extended [Balance (TS 5)]** | 256K | **655+ tok/s** | **49.6 tok/s** | **3.12 tok/round** | **0.42 MB** |
+| **Strata-Extended [Ultra-Turbo (TS 7)]** | 256K | **655+ tok/s** | **58–65+ tok/s** | **3.21 tok/round** | **<0.15 MB** |
+| **Zero-Disk in RAM Mode** | 32K | **933+ tok/s** | **65.5 tok/s** | **3.21 tok/round** | **0.00 MB** |
 
-<a id="option-a-the-strata-app"></a>
+---
 
-### Desktop app
+## 🚀 Quick Start
 
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
+### 1. Download Release
+Download the prebuilt Windows CUDA bundle from [Releases](https://github.com/Andgihat/Strata-Extended/releases/latest):
+* `strata-sakura-cp2-v0.2.16-windows-x86_64-cuda.zip`
 
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
+### 2. Launching with the Interactive Launcher
+Extract the archive and run:
+```cmd
+start_sakura_gyro_m.cmd
+```
+You will be prompted to select your execution profile:
+* `[1] DFlash2 + ЧИСТОЕ КАЧЕСТВО [No Tail-Skip, 100% MoE, ~45 t/s, PP 655+]`
+* `[2] DFlash2 + БАЛАНС          [Tail-Skip 5, ускорение до ~50 t/s, PP 655+]`
+* `[3] DFlash2 + УЛЬТРА-ТУРБО    [Tail-Skip 7, ускорение до ~65+ t/s, проверен на 3D коде]` *(Recommended)*
+* `[4] Чистый декод              [100% MoE, без спекуляции DFlash2, ~23.5 t/s]`
 
-<sub>Files: `Strata-0.2.15-windows-x64-setup.exe` · `Strata-0.2.15-linux-x86_64.AppImage` · `Strata-0.2.15-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+### 3. Connecting to OpenCode
+Add the provider to `~/.config/opencode/opencode.json`:
+```json
+"s2": {
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "S2 Sakura 125B",
+  "options": {
+    "baseURL": "http://127.0.0.1:8080/v1"
+  },
+  "models": {
+    "sakura": {
+      "name": "[xhigh] Sakura Gyro-M 256K (макс. reasoning)",
+      "limit": { "context": 262144, "output": 32768 },
+      "options": { "reasoning": { "effort": "xhigh" } }
+    }
+  }
+}
 ```
 
-**Windows PowerShell**
+---
 
-```powershell
-irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+## 🛠️ Building from Source
+
+```bash
+git clone https://github.com/Andgihat/Strata-Extended.git
+cd Strata-Extended
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DSTRATA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
+cmake --build . --config Release --parallel
 ```
 
-On Windows, open a new terminal afterwards. Then:
+---
 
-```sh
-strata launch
-```
-
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
-
-</details>
-
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
-
-<a id="build-from-source"></a>
-
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
-
-<a id="what-you-need"></a>
-
-## Hardware
-
-| Supported hardware | Guide |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
-| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
-
-<a id="using-it"></a>
-
-## Tools
-
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
-
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
-
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
-
-## Help
-
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](CONTRIBUTING.md)
-
-## Support Strata
-
-**Help keep local AI open to everyone.** A GitHub sponsorship or a coffee helps fund development and testing on more hardware.
-
-<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors: sponsor Strata" height="48"></a>
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
-
-### Loyal supporters
-
-Thank you to everyone who supports Strata.
-
-<!-- supporters:start (one line per public supporter, newest last; copy a line and change the GitHub name in all four places) -->
-<a href="https://github.com/ryan4yin"><img src="https://github.com/ryan4yin.png?size=96" width="48" height="48" alt="ryan4yin" title="ryan4yin"></a>
-<a href="https://github.com/themactep"><img src="https://github.com/themactep.png?size=96" width="48" height="48" alt="themactep" title="themactep"></a>
-<a href="https://github.com/macintog"><img src="https://github.com/macintog.png?size=96" width="48" height="48" alt="macintog" title="macintog"></a>
-<a href="https://github.com/bisonbet"><img src="https://github.com/bisonbet.png?size=96" width="48" height="48" alt="bisonbet" title="bisonbet"></a>
-<a href="https://github.com/vizv"><img src="https://github.com/vizv.png?size=96" width="48" height="48" alt="vizv" title="vizv"></a>
-<a href="https://github.com/kod88vn"><img src="https://github.com/kod88vn.png?size=96" width="48" height="48" alt="kod88vn" title="kod88vn"></a>
-<a href="https://github.com/seoulworker"><img src="https://github.com/seoulworker.png?size=96" width="48" height="48" alt="seoulworker" title="seoulworker"></a>
-<a href="https://github.com/jackyini"><img src="https://github.com/jackyini.png?size=96" width="48" height="48" alt="jackyini" title="jackyini"></a>
-<a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
-<!-- supporters:end -->
-
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
-
-<a id="option-c-let-your-ai-set-it-up"></a>
-
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
-
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
+## 📄 License & Credits
+Licensed under the [MIT License](LICENSE).  
+Based on [Strata](https://github.com/Niko1221/Strata) by Niko Veit.  
+Sakura CP2 architecture, Trellis kernels, Blackwell optimizations, and extended serving pipeline developed by [Andgihat](https://github.com/Andgihat).
