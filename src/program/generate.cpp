@@ -8782,7 +8782,11 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * nibble_max_slot_bytes();
-        size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
+        const char* fsv = std::getenv("STRATA_FS_SLOTS");
+        const int fs_slots_env = fsv ? std::atoi(fsv) : 0;
+        const size_t fs_reserve_b = fs_slots_env > 0 ? (size_t) fs_slots_env * (size_t) g.n_layers * (size_t) lay.max_blob : 0;
+        const size_t keep_res = ((size_t) o.vram_reserve_mib << 20) + fs_reserve_b;
+        size_t free_room = free_b > keep_res ? free_b - keep_res : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         uint64_t sum = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -8811,7 +8815,10 @@ int main(int argc, char** argv) {
         // held one slot fewer than asked (--expert-cache 1: none)
         const uint64_t budget = (uint64_t) o.expert_cache * ((nibble_max_slot_bytes() + 255) / 256 * 256);
         uint64_t used = 0;
-        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
+        const char* fsv = std::getenv("STRATA_FS_SLOTS");
+        const int fs_slots_env = fsv ? std::atoi(fsv) : 0;
+        const size_t fs_reserve_b = fs_slots_env > 0 ? (size_t) fs_slots_env * (size_t) g.n_layers * (size_t) lay.max_blob : 0;
+        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first + fs_reserve_b;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
@@ -22113,6 +22120,25 @@ int main(int argc, char** argv) {
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
+        // Foresight swap space (STRATA_FS_SLOTS; unset = null and nothing changes)
+        std::unique_ptr<strata::core::ForesightSwap> fs_swap;
+        {
+            int main_dev = 0;
+            cudaGetDevice(&main_dev);
+            std::vector<int> devs{main_dev};
+            for (auto& st : stages) devs.push_back(st->dev);
+            std::vector<int> card((size_t) g.n_layers, 0);
+            for (int64_t l = 0; l < g.n_layers; ++l) card[(size_t) l] = multi_gpu ? stage_of(l) : 0;
+            fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs));
+            drive.d.fs = fs_swap.get();
+            if (fs_swap && drive.d.lookahead != nullptr) lookahead.set_foresight(fs_swap.get());
+            src.set_foresight_swap(fs_swap.get());
+        }
+        struct FsDetachGen {
+            strata::core::RouterLookahead* la;
+            strata::core::FileExpertSource* src;
+            ~FsDetachGen() { if (la) la->set_foresight(nullptr); if (src) src->set_foresight_swap(nullptr); }
+        } fs_detach_gen{&lookahead, &src};
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
@@ -22756,6 +22782,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             ++rounds;
+            if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
             drafts_total += T - 1;
             drafts_ok += a;
             ++accepted_hist[(size_t) a];
@@ -22927,6 +22954,9 @@ int main(int argc, char** argv) {
             std::printf("%-24s CPU %.0f us + %.0f an expert + %.0f a PCIe one, GPU %.0f us + %.0f a PCIe expert (the "
                         "PCIe count per layer from these)\n", "pcie model", 1000 * pm.a, 1000 * pm.c, 1000 * pm.d,
                         1000 * pm.g0, 1000 * pm.g);
+        }
+        if (drive.d.fs != nullptr) {
+            std::printf("%-24s %s\n", "foresight", drive.d.fs->report().c_str());
         }
         (void) pool_ms0;
 #if defined(STRATA_HAVE_DFLASH2)

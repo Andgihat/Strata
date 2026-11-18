@@ -6639,6 +6639,7 @@ void ForesightSwap::fill_loop() {
             if (!failed.exchange(true)) std::fprintf(stderr, "strata serve: foresight swap: a copy failed - swap space off\n");
             continue;   // never marked issued: the slot is never used
         }
+        (void) cudaStreamQuery(s);   // WDDM hardware queue flush
         sl.issued.store(true, std::memory_order_release);
     }
 }
@@ -6650,11 +6651,15 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
     Slot& sl = slot[(size_t) (layer * slots + s)];
     if (!sl.ready) {
         if (!sl.loading || !sl.issued.load(std::memory_order_acquire)) { ++pending; return false; }
-        const cudaError_t q = cudaEventQuery((cudaEvent_t) sl.ev);
+        cudaError_t q = cudaEventQuery((cudaEvent_t) sl.ev);
         if (q != cudaSuccess) {
-            if (q != cudaErrorNotReady) cudaGetLastError();
-            ++pending;
-            return false;
+            // Overlapped prefetch: if copy is in flight on PCIe, synchronize event rather than bailing to slow CPU
+            q = cudaEventSynchronize((cudaEvent_t) sl.ev);
+            if (q != cudaSuccess) {
+                if (q != cudaErrorNotReady) cudaGetLastError();
+                ++pending;
+                return false;
+            }
         }
         sl.ready = true;
         sl.loading = false;
@@ -6725,8 +6730,8 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
     const int c = layer_card[(size_t) layer];
     if (card_round[(size_t) c] != now) { card_round[(size_t) c] = now; card_used[(size_t) c] = 0; }
     if (card_used[(size_t) c] >= budget) { ++over_budget; return; }
-    if (src == nullptr || !src->pinned(layer, expert)) return;   // async copies need the pinned arena
-    const uint8_t* b = src->blob(layer, expert);
+    if (src == nullptr) return;
+    const uint8_t* b = src->blob_stable(layer, expert);
     if (b == nullptr) return;
     int best = -1;
     uint64_t best_ref = ~0ull;
@@ -6790,7 +6795,8 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     auto env_int = [](const char* name, int def, int lo) { const char* e = std::getenv(name); const int x = e ? std::atoi(e) : def; return x < lo ? lo : x; };
     f->budget = env_int("STRATA_FS_BUDGET", 32, 1);
     f->admit = env_int("STRATA_FS_ADMIT", 1, 1);
-    f->depth = env_int("STRATA_FS_DEPTH", 4, 2);
+    const int def_depth = (std::getenv("STRATA_PIPELINE_WINDOWS") && std::atoi(std::getenv("STRATA_PIPELINE_WINDOWS")) > 1) ? 4 : 1;
+    f->depth = env_int("STRATA_FS_DEPTH", def_depth, 1);
     f->verify = env_int("STRATA_FS_VERIFY", 0, 0) != 0;
     std::string err;
     if (!f->init(std::min(slots, 64), layers, experts, card_of_layer, devices, err)) {
