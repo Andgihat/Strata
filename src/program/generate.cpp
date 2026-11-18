@@ -22485,6 +22485,9 @@ int main(int argc, char** argv) {
         int dfr_n = 0;
         int64_t dfr_pos = 0;
         int32_t dfr_anchor = 0;
+        std::vector<int32_t> df2_alt_d(strata::core::Dflash2Drafter::kDrafts, -1);
+        int df2_alt_div = -1;
+        int df2_tree_hits = 0, df2_tree_rej = 0;
         // the next round's drafts after a commit: the MTP chain, or the DFlash2 block from the committed rows' taps
         auto draft_next = [&](int T_, int a_) -> bool {
 #if defined(STRATA_HAVE_DFLASH2)
@@ -22500,8 +22503,15 @@ int main(int argc, char** argv) {
                 if (wait_commit_first && !ver.wait_commit(err)) return false;
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
-                if (!df2.draft(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;
-                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
+                int32_t alt_dd[strata::core::Dflash2Drafter::kDrafts];
+                int alt_div = -1;
+                if (!df2.draft(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err, alt_dd, &alt_div)) return false;
+                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                    drafts[i] = dd[i];
+                    dprob[i] = pp[i];
+                    df2_alt_d[i] = alt_dd[i];
+                }
+                df2_alt_div = alt_div;
                 // what the MTP does while it drafts: the PLE rows of the tokens the next window will hold are read ahead
                 // (the window's gather would otherwise wait for them: 1.8 ms a round on strix)
                 if (ss.ple.ready() && ss.ple.table != nullptr) {
@@ -22547,8 +22557,15 @@ int main(int argc, char** argv) {
                 } else {
                     int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                     float pp[strata::core::Dflash2Drafter::kDrafts];
-                    if (!df2.draft(ver.tap_dev(), dfr_n, dfr_pos, dfr_anchor, dd, pp, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
-                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
+                    int32_t alt_dd[strata::core::Dflash2Drafter::kDrafts];
+                    int alt_div = -1;
+                    if (!df2.draft(ver.tap_dev(), dfr_n, dfr_pos, dfr_anchor, dd, pp, err, alt_dd, &alt_div)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                        drafts[i] = dd[i];
+                        dprob[i] = pp[i];
+                        df2_alt_d[i] = alt_dd[i];
+                    }
+                    df2_alt_div = alt_div;
                 }
             }
 #endif
@@ -22737,6 +22754,12 @@ int main(int argc, char** argv) {
             drafts_total += T - 1;
             drafts_ok += a;
             ++accepted_hist[(size_t) a];
+            if (use_df2 && !from_sfx && !initial_round && a < T - 1 && a < 8) {
+                ++df2_tree_rej;
+                if (df2_alt_div >= 0 && (size_t) a < df2_alt_d.size() && df2_alt_d[(size_t) a] == outv[(size_t) a]) {
+                    ++df2_tree_hits;
+                }
+            }
             if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
             bool eos = false;
@@ -22902,10 +22925,12 @@ int main(int argc, char** argv) {
         }
         (void) pool_ms0;
 #if defined(STRATA_HAVE_DFLASH2)
-        if (use_df2 && df2.rounds > 0)
-            std::printf("%-24s %.3f ms/round drafting (%lld rounds, GPU %.3f), %.0f MiB of VRAM\n", "dflash2", df2.ms_draft / (double) df2.rounds,
-                        (long long) df2.rounds, df2.ms_gpu / (double) df2.rounds, (double) df2.vram_bytes() / 1048576.0);
-        else
+        if (use_df2 && df2.rounds > 0) {
+            const double tree_rate = df2_tree_rej > 0 ? (100.0 * df2_tree_hits / (double) df2_tree_rej) : 0.0;
+            std::printf("%-24s %.3f ms/round drafting (%lld rounds, GPU %.3f), %.0f MiB of VRAM  tree_alt=%d/%d (%.1f%%)\n", "dflash2", df2.ms_draft / (double) df2.rounds,
+                        (long long) df2.rounds, df2.ms_gpu / (double) df2.rounds, (double) df2.vram_bytes() / 1048576.0,
+                        df2_tree_hits, df2_tree_rej, tree_rate);
+        } else
 #endif
         if (use_mtp && rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
