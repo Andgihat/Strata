@@ -92,10 +92,10 @@ Extract the archive and run:
 start_sakura_gyro_m.cmd
 ```
 You will be prompted to select your execution profile:
-* `[1] DFlash2 + ЧИСТОЕ КАЧЕСТВО [No Tail-Skip, 100% MoE, ~45 t/s, PP 655+]`
-* `[2] DFlash2 + БАЛАНС          [Tail-Skip 5, ускорение до ~50 t/s, PP 655+]`
-* `[3] DFlash2 + УЛЬТРА-ТУРБО    [Tail-Skip 7, ускорение до ~65+ t/s, проверен на 3D коде]` *(Recommended)*
-* `[4] Чистый декод              [100% MoE, без спекуляции DFlash2, ~23.5 t/s]`
+* `[1] DFlash2 + Pure Quality  [No Tail-Skip, 100% MoE, ~45 t/s, PP 655+]`
+* `[2] DFlash2 + Balanced      [Tail-Skip 5, speedup up to ~50 t/s, PP 655+]`
+* `[3] DFlash2 + Ultra-Turbo   [Tail-Skip 7, speedup up to ~65+ t/s, verified on 3D code]` *(Recommended)*
+* `[4] Pure Decode             [100% MoE, without DFlash2 speculation, ~23.5 t/s]`
 
 ### 3. Connecting to OpenCode
 Add the provider to `~/.config/opencode/opencode.json`:
@@ -108,7 +108,7 @@ Add the provider to `~/.config/opencode/opencode.json`:
   },
   "models": {
     "sakura": {
-      "name": "[xhigh] Sakura Gyro-M 256K (макс. reasoning)",
+      "name": "[xhigh] Sakura Gyro-M 256K (Max reasoning)",
       "limit": { "context": 262144, "output": 32768 },
       "options": { "reasoning": { "effort": "xhigh" } }
     }
