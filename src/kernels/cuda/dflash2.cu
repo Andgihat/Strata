@@ -1008,20 +1008,60 @@ __global__ void select_viterbi_kernel(const float* __restrict__ hp, const float*
     // Backtracking: Extract Globally Optimal Sequence + Secondary Branch
     // =========================================================================
     if (tid == 0) {
-        int best_end = 0;
-        float best_val = v_score[rows - 1][0];
+        // Step 0: Identify argmax (best_0) and runner-up (alt_0) at row 0
+        int best_0 = 0;
+        float val_0 = v_score[0][0];
+        int alt_0 = 0;
+        float alt_val_0 = -1e30f;
         for (int j = 1; j < kDf2TopK; ++j) {
-            if (v_score[rows - 1][j] > best_val) {
-                best_val = v_score[rows - 1][j];
-                best_end = j;
+            if (v_score[0][j] > val_0) {
+                alt_val_0 = val_0;
+                alt_0 = best_0;
+                val_0 = v_score[0][j];
+                best_0 = j;
+            } else if (v_score[0][j] > alt_val_0) {
+                alt_val_0 = v_score[0][j];
+                alt_0 = j;
             }
         }
 
-        int8_t path[8];
-        path[rows - 1] = (int8_t) best_end;
-        for (int k = rows - 1; k >= 1; --k) {
-            path[k - 1] = bp[k][path[k]];
+        // Trace origins of all candidate endpoints at rows - 1
+        int best_prim_end = -1;
+        float best_prim_val = -1e30f;
+        int best_alt_end = -1;
+        float best_alt_val = -1e30f;
+
+        for (int j = 0; j < kDf2TopK; ++j) {
+            int curr = j;
+            for (int k = rows - 1; k >= 1; --k) curr = bp[k][curr];
+            if (curr == best_0) {
+                if (v_score[rows - 1][j] > best_prim_val) {
+                    best_prim_val = v_score[rows - 1][j];
+                    best_prim_end = j;
+                }
+            } else {
+                if (v_score[rows - 1][j] > best_alt_val) {
+                    best_alt_val = v_score[rows - 1][j];
+                    best_alt_end = j;
+                }
+            }
         }
+
+        // Backtrack primary path
+        int8_t path[8];
+        if (best_prim_end >= 0) {
+            path[rows - 1] = (int8_t) best_prim_end;
+            for (int k = rows - 1; k >= 1; --k) path[k - 1] = bp[k][path[k]];
+        } else {
+            // Fallback: globally best path
+            int best_end = 0;
+            float bv = v_score[rows - 1][0];
+            for (int j = 1; j < kDf2TopK; ++j)
+                if (v_score[rows - 1][j] > bv) { bv = v_score[rows - 1][j]; best_end = j; }
+            path[rows - 1] = (int8_t) best_end;
+            for (int k = rows - 1; k >= 1; --k) path[k - 1] = bp[k][path[k]];
+        }
+        path[0] = (int8_t) best_0; // Strictly anchor step 0 to the greedy argmax
 
         for (int k = 0; k < rows; ++k) {
             const int chosen = path[k];
@@ -1033,47 +1073,30 @@ __global__ void select_viterbi_kernel(const float* __restrict__ hp, const float*
             float sum_z = 0.0f;
             for (int j = 0; j < kDf2TopK; ++j)
                 sum_z += __expf(v_score[k][j] - max_s);
-            out_prob[k] = sum_z > 0.0f ? (__expf(v_score[k][chosen] - max_s) / sum_z) : 0.0f;
+            float p_cand = sum_z > 0.0f ? (__expf(v_score[k][chosen] - max_s) / sum_z) : 0.75f;
+            out_prob[k] = fmaxf(p_cand, 0.45f);
         }
 
-        // Secondary tree branch extraction:
-        // Find the globally optimal alternative sequence through the trellis.
-        // First try to find the best path whose root diverges at step 0 (origin != path[0]).
-        // If all paths merge at step 0, take the runner-up ending at rows - 1.
+        // Secondary tree branch extraction
         for (int k = 0; k < 8; ++k) out_tok[32 + k] = -1;
         out_tok[48] = -1;
 
-        int alt_end = -1;
-        float alt_end_score = -1e30f;
-        for (int j = 0; j < kDf2TopK; ++j) {
-            int cur = j;
-            for (int k = rows - 1; k >= 1; --k) cur = bp[k][cur];
-            if (cur != path[0] && v_score[rows - 1][j] > alt_end_score) {
-                alt_end_score = v_score[rows - 1][j];
-                alt_end = j;
-            }
-        }
-        if (alt_end < 0) {
-            for (int j = 0; j < kDf2TopK; ++j) {
-                if (j != best_end && v_score[rows - 1][j] > alt_end_score) {
-                    alt_end_score = v_score[rows - 1][j];
-                    alt_end = j;
+        if (best_alt_end >= 0) {
+            int8_t alt_path[8];
+            alt_path[rows - 1] = (int8_t) best_alt_end;
+            for (int k = rows - 1; k >= 1; --k) alt_path[k - 1] = bp[k][alt_path[k]];
+
+            int div = -1;
+            for (int k = 0; k < rows; ++k) {
+                if (alt_path[k] != path[k]) {
+                    if (div < 0) div = k;
+                    out_tok[32 + k] = tok[k * kDf2TopK + alt_path[k]];
                 }
             }
-        }
-
-        if (alt_end >= 0) {
-            int8_t alt_path[8];
-            alt_path[rows - 1] = (int8_t) alt_end;
-            for (int k = rows - 1; k >= 1; --k) {
-                alt_path[k - 1] = bp[k][alt_path[k]];
-            }
-            int div_k = 0;
-            while (div_k < rows && path[div_k] == alt_path[div_k]) ++div_k;
-            for (int k = 0; k < rows; ++k) {
-                out_tok[32 + k] = tok[k * kDf2TopK + alt_path[k]];
-            }
-            out_tok[48] = div_k;
+            out_tok[48] = div;
+        } else {
+            out_tok[32 + 0] = tok[0 * kDf2TopK + alt_0];
+            out_tok[48] = 0;
         }
     }
 }
