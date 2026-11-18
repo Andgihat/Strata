@@ -1012,8 +1012,9 @@ bool Dflash2Drafter::context_wait(std::string& err) {
     return true;
 }
 
-bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err) {
-    return draft_launch(taps, n_new, pos0, anchor, err) && draft_finish(drafts, probs, err);
+bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err,
+                           int32_t* alt_drafts, int32_t* alt_diverge) {
+    return draft_launch(taps, n_new, pos0, anchor, err) && draft_finish(drafts, probs, err, alt_drafts, alt_diverge);
 }
 
 bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
@@ -1036,7 +1037,8 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     h_meta_[17] = (int32_t) s;
     h_meta_[24] = anchor;
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
-    for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
+    for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; ((volatile int32_t*) h_out_)[32 + i] = -1; }
+    ((volatile int32_t*) h_out_)[48] = -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     log_stage(pos0, n_new);
     if (timing_) cudaEventRecord(ev_a_, cs_);
@@ -1060,7 +1062,8 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     return true;
 }
 
-bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& err) {
+bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& err,
+                                  int32_t* alt_drafts, int32_t* alt_diverge) {
     if (!launched_) { err = "dflash2: draft_finish without draft_launch"; return false; }
     launched_ = false;
     const OnDevice on_device(device_);
@@ -1073,7 +1076,11 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         const bool made = i < ndraft_;
         drafts[i] = made ? ((volatile int32_t*) h_out_)[i] : 0;
         if (probs) probs[i] = made ? ((volatile float*) h_out_)[16 + i] : 0.0f;
+        last_alt_drafts_[i] = made ? ((volatile int32_t*) h_out_)[32 + i] : -1;
+        if (alt_drafts) alt_drafts[i] = last_alt_drafts_[i];
     }
+    last_alt_diverge_ = ((volatile int32_t*) h_out_)[48];
+    if (alt_diverge) *alt_diverge = last_alt_diverge_;
     if (timing_) {
         float ms = 0;
         if (cudaEventElapsedTime(&ms, ev_a_, ev_b_) == cudaSuccess) ms_gpu += ms;

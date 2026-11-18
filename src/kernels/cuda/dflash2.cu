@@ -899,6 +899,185 @@ __global__ void select_kernel(const float* __restrict__ hp, const float* __restr
     }
 }
 
+// ---- Trellis Viterbi candidate selector: one block of 256 threads
+// Computes the globally optimal sequence of candidates through the DFlash2 lattice
+// using dynamic programming over all 16 candidates at each of the 'rows' draft steps.
+// Also extracts the top alternative tree branch for tree speculation.
+template <bool Q4>
+__global__ void select_viterbi_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
+                                      const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
+                                      const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+    __shared__ float vp[256];
+    __shared__ float v_score[8][kDf2TopK];  // cumulative Viterbi scores
+    __shared__ int8_t bp[8][kDf2TopK];      // backpointers: predecessor index (0..15)
+    __shared__ int anchor_s;
+    __shared__ int prev_tok_s;
+
+    const int tid = threadIdx.x;
+    const int w = tid >> 5;                 // warp index 0..7
+    const int lane = tid & 31;              // lane index 0..31
+
+    if (rows <= 0 || rows > 8) return;
+
+    // =========================================================================
+    // Step 0: Transitions from anchor_tok to the 16 candidates of row 0
+    // =========================================================================
+    if (tid == 0) anchor_s = *anchor_tok;
+    __syncthreads();
+    const int anchor = anchor_s;
+
+    if (Q4) vp[tid] = q4row_at(reinterpret_cast<const uint8_t*>(pred_cb) + (size_t) anchor * (rank / 32 * 18), tid) * hp[tid];
+    else vp[tid] = bf16f(pred_cb[(size_t) anchor * rank + tid]) * hp[tid];
+    __syncthreads();
+
+    for (int j = w * 2; j < w * 2 + 2; ++j) {
+        const int t = tok[j]; // row 0: tok[0 * 16 + j]
+        float acc = 0.0f;
+        if (Q4) {
+            const uint8_t* row_cb = reinterpret_cast<const uint8_t*>(succ_cb) + (size_t) t * (rank / 32 * 18);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc = fmaf(q4row_at(row_cb, lane * 8 + e), vp[lane * 8 + e], acc);
+        } else {
+            const uint4 raw = *reinterpret_cast<const uint4*>(succ_cb + (size_t) t * rank + lane * 8);
+            const uint32_t u[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                acc = fmaf(__uint_as_float(u[e] << 16), vp[lane * 8 + e * 2], acc);
+                acc = fmaf(__uint_as_float(u[e] & 0xffff0000u), vp[lane * 8 + e * 2 + 1], acc);
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) {
+            v_score[0][j] = unary[j] + acc;
+            bp[0][j] = 0;
+        }
+    }
+    __syncthreads();
+
+    // =========================================================================
+    // Steps 1 .. rows - 1: Full Trellis Dynamic Programming
+    // =========================================================================
+    for (int i = 1; i < rows; ++i) {
+        if (tid < kDf2TopK) {
+            v_score[i][tid] = -1e30f;
+            bp[i][tid] = 0;
+        }
+        __syncthreads();
+
+        for (int p = 0; p < kDf2TopK; ++p) {
+            if (tid == 0) prev_tok_s = tok[(i - 1) * kDf2TopK + p];
+            __syncthreads();
+            const int prev_tok = prev_tok_s;
+
+            if (Q4) vp[tid] = q4row_at(reinterpret_cast<const uint8_t*>(pred_cb) + (size_t) prev_tok * (rank / 32 * 18), tid) * hp[(size_t) i * rank + tid];
+            else vp[tid] = bf16f(pred_cb[(size_t) prev_tok * rank + tid]) * hp[(size_t) i * rank + tid];
+            __syncthreads();
+
+            const float prev_v = v_score[i - 1][p];
+
+            for (int j = w * 2; j < w * 2 + 2; ++j) {
+                const int t = tok[i * kDf2TopK + j];
+                float acc = 0.0f;
+                if (Q4) {
+                    const uint8_t* row_cb = reinterpret_cast<const uint8_t*>(succ_cb) + (size_t) t * (rank / 32 * 18);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) acc = fmaf(q4row_at(row_cb, lane * 8 + e), vp[lane * 8 + e], acc);
+                } else {
+                    const uint4 raw = *reinterpret_cast<const uint4*>(succ_cb + (size_t) t * rank + lane * 8);
+                    const uint32_t u[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        acc = fmaf(__uint_as_float(u[e] << 16), vp[lane * 8 + e * 2], acc);
+                        acc = fmaf(__uint_as_float(u[e] & 0xffff0000u), vp[lane * 8 + e * 2 + 1], acc);
+                    }
+                }
+                for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+                if (lane == 0) {
+                    const float cand_path = prev_v + (unary[i * kDf2TopK + j] + acc);
+                    if (cand_path > v_score[i][j]) {
+                        v_score[i][j] = cand_path;
+                        bp[i][j] = (int8_t) p;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // =========================================================================
+    // Backtracking: Extract Globally Optimal Sequence + Secondary Branch
+    // =========================================================================
+    if (tid == 0) {
+        int best_end = 0;
+        float best_val = v_score[rows - 1][0];
+        for (int j = 1; j < kDf2TopK; ++j) {
+            if (v_score[rows - 1][j] > best_val) {
+                best_val = v_score[rows - 1][j];
+                best_end = j;
+            }
+        }
+
+        int8_t path[8];
+        path[rows - 1] = (int8_t) best_end;
+        for (int k = rows - 1; k >= 1; --k) {
+            path[k - 1] = bp[k][path[k]];
+        }
+
+        for (int k = 0; k < rows; ++k) {
+            const int chosen = path[k];
+            out_tok[k] = tok[k * kDf2TopK + chosen];
+
+            float max_s = v_score[k][0];
+            for (int j = 1; j < kDf2TopK; ++j)
+                if (v_score[k][j] > max_s) max_s = v_score[k][j];
+            float sum_z = 0.0f;
+            for (int j = 0; j < kDf2TopK; ++j)
+                sum_z += __expf(v_score[k][j] - max_s);
+            out_prob[k] = sum_z > 0.0f ? (__expf(v_score[k][chosen] - max_s) / sum_z) : 0.0f;
+        }
+
+        // Secondary tree branch extraction:
+        // Find the globally optimal alternative sequence through the trellis.
+        // First try to find the best path whose root diverges at step 0 (origin != path[0]).
+        // If all paths merge at step 0, take the runner-up ending at rows - 1.
+        for (int k = 0; k < 8; ++k) out_tok[32 + k] = -1;
+        out_tok[48] = -1;
+
+        int alt_end = -1;
+        float alt_end_score = -1e30f;
+        for (int j = 0; j < kDf2TopK; ++j) {
+            int cur = j;
+            for (int k = rows - 1; k >= 1; --k) cur = bp[k][cur];
+            if (cur != path[0] && v_score[rows - 1][j] > alt_end_score) {
+                alt_end_score = v_score[rows - 1][j];
+                alt_end = j;
+            }
+        }
+        if (alt_end < 0) {
+            for (int j = 0; j < kDf2TopK; ++j) {
+                if (j != best_end && v_score[rows - 1][j] > alt_end_score) {
+                    alt_end_score = v_score[rows - 1][j];
+                    alt_end = j;
+                }
+            }
+        }
+
+        if (alt_end >= 0) {
+            int8_t alt_path[8];
+            alt_path[rows - 1] = (int8_t) alt_end;
+            for (int k = rows - 1; k >= 1; --k) {
+                alt_path[k - 1] = bp[k][alt_path[k]];
+            }
+            int div_k = 0;
+            while (div_k < rows && path[div_k] == alt_path[div_k]) ++div_k;
+            for (int k = 0; k < rows; ++k) {
+                out_tok[32 + k] = tok[k * kDf2TopK + alt_path[k]];
+            }
+            out_tok[48] = div_k;
+        }
+    }
+}
+
 __global__ void tap_rows_kernel(const float* __restrict__ R, float* __restrict__ out, int64_t out_stride, int64_t n, int hc) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int r = blockIdx.y;
@@ -1158,8 +1337,17 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
                 const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4) {
     if (rank != 256) throw std::invalid_argument("df2_select: the selector rank must be 256");
-    if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
-    else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    static const bool viterbi_on = [] {
+        const char* e = std::getenv("STRATA_DF2_VITERBI");
+        return !(e && e[0] == '0');
+    }();
+    if (viterbi_on && rows <= 8) {
+        if (cb_q4) select_viterbi_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+        else select_viterbi_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    } else {
+        if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+        else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    }
     check("select");
 }
 

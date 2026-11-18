@@ -20262,6 +20262,9 @@ int main(int argc, char** argv) {
             int dfr_n = 0;
             int64_t dfr_pos = 0;
             int32_t dfr_anchor = 0;
+            std::vector<int32_t> df2_alt_d(strata::core::Dflash2Drafter::kDrafts, -1);
+            int df2_alt_div = -1;
+            int df2_tree_hits = 0, df2_tree_rej = 0;
             // a long suffix match: the next round's DFlash2 draft is deferred to that round's start (spec/window_rule.hpp skip_draft_for_lookup)
             auto defer_df2 = [&](int a_) -> bool {
                 if (o.suffix_draft <= 0 || df2_skip_min <= 0 || !req_df2) return false;
@@ -20274,9 +20277,16 @@ int main(int argc, char** argv) {
             auto draft_df2 = [&](int a_) -> bool {
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
+                int32_t alt_dd[strata::core::Dflash2Drafter::kDrafts];
+                int32_t alt_div = -1;
                 const float* tp = df2_win_taps(a_ + 1, err);
-                if (tp == nullptr || !df2.draft(tp, a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;
-                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
+                if (tp == nullptr || !df2.draft(tp, a_ + 1, p, outv[(size_t) a_], dd, pp, err, alt_dd, &alt_div)) return false;
+                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                    drafts[i] = dd[i];
+                    dprob[i] = pp[i];
+                    df2_alt_d[i] = alt_dd[i];
+                }
+                df2_alt_div = alt_div;
                 if (ss.ple.ready() && ss.ple.table != nullptr) {   // the PLE rows of the next window's tokens, read ahead (as the MTP's draft does)
                     int n_pf = 0;
                     const int cap = std::min<int>(S_mtp, (int) drafts.size() + 1);
@@ -20686,6 +20696,12 @@ int main(int argc, char** argv) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
+                if (req_df2 && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
+                    ++df2_tree_rej;
+                    if (df2_alt_div >= 0 && (size_t) a < df2_alt_d.size() && df2_alt_d[(size_t) a] == outv[(size_t) a]) {
+                        ++df2_tree_hits;
+                    }
+                }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
@@ -20861,10 +20877,14 @@ int main(int argc, char** argv) {
                 b.tps[w] = b.n[w] == 0 ? tps : 0.65 * b.tps[w] + 0.35 * tps;
                 ++b.n[w];
             }
-            if (draft_log && use_df2)
-                std::fprintf(stderr, "strata draft: request %lld drafter=%s window<=%d tokens=%lld rounds=%lld decode_ms=%.1f keep_ms=%.1f (%.3f per round)\n",
+            if (draft_log && use_df2) {
+                const double tree_rate = df2_tree_rej > 0 ? (100.0 * df2_tree_hits / (double) df2_tree_rej) : 0.0;
+                const double acc_rate = (double) draft_accepted / (double) std::max<int64_t>(1, rounds - rounds_at_start);
+                std::fprintf(stderr, "strata draft: request %lld drafter=%s window<=%d tokens=%lld rounds=%lld (accept %.2f/rnd) tree_alt=%d/%d (%.1f%%) decode_ms=%.1f keep_ms=%.1f (%.3f per round)\n",
                              (long long) ++draft_req_count, req_df2 ? "dflash2" : "mtp", S_mtp, (long long) produced_n, (long long) (rounds - rounds_at_start),
-                             decode_ms, keep_ms, rounds > rounds_at_start ? keep_ms / (double) (rounds - rounds_at_start) : 0.0);
+                             acc_rate, df2_tree_hits, df2_tree_rej, tree_rate, decode_ms, keep_ms,
+                             rounds > rounds_at_start ? keep_ms / (double) (rounds - rounds_at_start) : 0.0);
+            }
             // --draft-costs: at a request's end, a learning stretch that is long enough becomes this machine's table (from the next request
             // on); one that looks disturbed (a load beside the engine, a stall) is dropped and learned again
             if (dc_learning && policy.learning()) {

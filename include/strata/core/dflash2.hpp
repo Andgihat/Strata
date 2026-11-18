@@ -135,12 +135,18 @@ public:
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
     /// then the block for `anchor` (the last committed token, at pos0 + n_new).  `drafts` / `probs` get kDrafts entries (the
     /// selector's pick and its probability).  The taps pointer must be the same device buffer on every call (graphs are captured on it).
-    bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
+    bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err,
+               int32_t* alt_drafts = nullptr, int32_t* alt_diverge = nullptr);
 
     /// draft() in two halves: draft_launch queues the round's graph and returns, draft_finish waits and reads the picks.  Several drafters (batch slots, each on its
     /// own stream) can launch first and finish after, so their graphs run at the same time.
     bool draft_launch(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, std::string& err);
-    bool draft_finish(int32_t* drafts, float* probs, std::string& err);
+    bool draft_finish(int32_t* drafts, float* probs, std::string& err,
+                      int32_t* alt_drafts = nullptr, int32_t* alt_diverge = nullptr);
+
+    /// The secondary alternative tree branch from the Viterbi trellis (depth-1 divergence or runner-up sequence).
+    const int32_t* last_alt_drafts() const { return last_alt_drafts_; }
+    int32_t last_alt_diverge() const { return last_alt_diverge_; }
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
@@ -279,6 +285,8 @@ private:
     int launch_n_ = 0;
     int64_t launch_pos0_ = 0;
     std::chrono::steady_clock::time_point launch_t0_{};
+    int32_t last_alt_drafts_[kDrafts] = {-1, -1, -1, -1, -1, -1, -1};
+    int32_t last_alt_diverge_ = -1;
 };
 
 }  // namespace strata::core
