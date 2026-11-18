@@ -29,7 +29,12 @@ struct QsaAttnPools {
     const uint16_t* v_scale = nullptr;
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
+    const uint8_t* k_fp8 = nullptr;     ///< fp8 codes [page][kv_head][page_size][head_dim]
+    const uint8_t* v_fp8 = nullptr;
+    const uint16_t* k_fp8_scale = nullptr; ///< fp16 [page][kv_head][page_size][head_dim / 64]
+    const uint16_t* v_fp8_scale = nullptr;
     const int32_t* page_table = nullptr;
+    bool fp8_e5m2 = false;
 };
 
 /// Batch windows: every query's own K/V pools - query z reads p[z] (z < n).  n = 0: the call's one `pools`.

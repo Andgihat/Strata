@@ -46,6 +46,7 @@
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_fp8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/dispatch_stats.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
@@ -2024,6 +2025,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     } else if (st.kv_q4)
                         kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
                                            &st.host);
+                    else if (st.kv_fp8)
+                        kv_append_fp8_steps(st.k_fp8, st.v_fp8, st.k_fp8_scale, st.v_fp8_scale, st.page_table, step_b, kStepCount,
+                                            kc_b, vc_b, (int) (NKV * HD), n, s, cs, &st.host, st.kv_fp8_e5m2);
                     else if (st.kv_int8)
                         kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
                                            kc_b, vc_b, (int) (NKV * HD), n, s, cs, &st.host);
@@ -2045,6 +2049,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     } else if (st.kv_q4)
                         kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                    else if (st.kv_fp8)
+                        kv_append_fp8_step(st.k_fp8, st.v_fp8, st.k_fp8_scale, st.v_fp8_scale, st.page_table, step_t,
+                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host, st.kv_fp8_e5m2);
                     else if (st.kv_int8)
                         kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);

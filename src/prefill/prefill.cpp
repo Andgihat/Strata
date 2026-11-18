@@ -57,6 +57,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_fp8.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
@@ -3044,6 +3045,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         }
         if (st.kv_q4) {
             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+        } else if (st.kv_fp8) {
+            strata::kernels::kv_append_fp8(st.k_fp8, st.v_fp8, st.k_fp8_scale, st.v_fp8_scale, st.page_table, c0, nb,
+                                           Kc, Vc, s, m.cs, &st.host, nullptr, st.kv_fp8_e5m2);
         } else {
             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
@@ -5044,6 +5048,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
                                                           host_w, staged ? &m.stage : nullptr);
+                        else if (st.kv_fp8)
+                            strata::kernels::kv_append_fp8(st.k_fp8, st.v_fp8, st.k_fp8_scale, st.v_fp8_scale,
+                                                           st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                                           host_w, staged ? &m.stage : nullptr, st.kv_fp8_e5m2);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
@@ -8747,6 +8755,10 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             if (st.kv_q4)
                                 strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, cs,
                                                               host_w, staged ? &m.stage : nullptr);
+                            else if (st.kv_fp8)
+                                strata::kernels::kv_append_fp8(st.k_fp8, st.v_fp8, st.k_fp8_scale, st.v_fp8_scale,
+                                                               st.page_table, p0, T, m.Kc, m.Vc, s, cs,
+                                                               host_w, staged ? &m.stage : nullptr, st.kv_fp8_e5m2);
                             else
                                 kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                           st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs,

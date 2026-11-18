@@ -38,14 +38,17 @@ struct KvHostPools {
     uint16_t* v_scale = nullptr;
     uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
     uint8_t* v_q4 = nullptr;
-    bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
+    uint8_t* k_fp8 = nullptr;     ///< fp8 mode (kv_fp8.hpp): 1 byte per value (256 B per cell and head)
+    uint8_t* v_fp8 = nullptr;
+    uint16_t* k_fp8_scale = nullptr; ///< fp8 mode: fp16 scale per 64 values
+    uint16_t* v_fp8_scale = nullptr;
+    bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr || k_fp8 != nullptr; }
 };
 
-/// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0, and
-/// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`).
-/// (A bool `int8` argument still reads as kKvF16 / kKvInt8.)  kKvHybrid is 3, the number conversation snapshots
-/// already give K8V4.
-enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3 };
+/// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0,
+/// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`),
+/// and FP8 (`--kv fp8` / `--kv fp8_e4m3` / `--kv fp8_e5m2`: 1 byte per value + fp16 scale per 64 values).
+enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3, kKvFp8 = 4, kKvFp8E5M2 = 5 };
 
 /// K8V4's halves as the single-format append kernels see them, so a hybrid layer's host copy (and the prompt path's
 /// staging pool) is written by the same calls that write its VRAM pools: K is "int8 whose V is K", V is "q4_0 whose

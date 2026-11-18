@@ -52,6 +52,13 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         r.src[2] = (const uint8_t*) host.k_scale; r.dst[2] = (uint8_t*) slots.k_scale; r.len[2] = scales;
         r.src[3] = (const uint8_t*) host.v_scale; r.dst[3] = (uint8_t*) slots.v_scale; r.len[3] = scales;
         r.n = 4;
+    } else if (fmt == kKvFp8 || fmt == kKvFp8E5M2) {
+        const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
+        r.src[0] = (const uint8_t*) host.k_fp8;       r.dst[0] = (uint8_t*) slots.k_fp8;       r.len[0] = codes;
+        r.src[1] = (const uint8_t*) host.v_fp8;       r.dst[1] = (uint8_t*) slots.v_fp8;       r.len[1] = codes;
+        r.src[2] = (const uint8_t*) host.k_fp8_scale; r.dst[2] = (uint8_t*) slots.k_fp8_scale; r.len[2] = scales;
+        r.src[3] = (const uint8_t*) host.v_fp8_scale; r.dst[3] = (uint8_t*) slots.v_fp8_scale; r.len[3] = scales;
+        r.n = 4;
     } else {
         const int bytes = rows * (int) s.head_dim * 2;
         r.src[0] = (const uint8_t*) host.k_pool; r.dst[0] = (uint8_t*) slots.k_pool; r.len[0] = bytes;
@@ -202,6 +209,8 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 +
                rows * kv_q4_bytes_per_head((int) s.head_dim);
     if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+    if (fmt == kKvFp8 || fmt == kKvFp8E5M2)
+        return rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2;
     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
 }

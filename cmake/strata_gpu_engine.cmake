@@ -85,6 +85,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/kv_fp8.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -1196,6 +1197,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+  # Native FP8 (E4M3 / E5M2) KV cache on Blackwell sm_120 vs host references (GPU, synthetic, no model).
+  add_executable(kv_fp8_parity src/kernels/kv_fp8_parity.cpp)
+  target_include_directories(kv_fp8_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_fp8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_fp8_parity COMMAND kv_fp8_parity)
   # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)

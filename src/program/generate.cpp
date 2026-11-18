@@ -1186,6 +1186,9 @@ void usage() {
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
+                 "  --kv fp8|fp8_e4m3    hardware FP8 (E4M3) KV cache with group-64 FP16 scaling for Blackwell sm_120;\n"
+                 "                       half of FP16 memory with full dynamic range preservation\n"
+                 "  --kv fp8_e5m2        hardware FP8 (E5M2) KV cache with group-64 FP16 scaling\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
@@ -4716,12 +4719,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    const bool is_fp8 = (o.kv == "fp8" || o.kv == "fp8_e4m3" || o.kv == "fp8_e5m2");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && !is_fp8) {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4, fp8, fp8_e4m3 or fp8_e5m2\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    strata::core::qsa_set_kv_fp8(is_fp8, o.kv == "fp8_e5m2");
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");

@@ -219,6 +219,13 @@ struct QsaState {
     bool kv_q4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
+    /// Hardware FP8 KV (E4M3 / E5M2) with FP16 scale per 64 values (qsa_set_kv_fp8, kv_fp8.hpp): 132 B per cell and head
+    bool kv_fp8 = false;
+    bool kv_fp8_e5m2 = false;
+    uint8_t* k_fp8 = nullptr;
+    uint8_t* v_fp8 = nullptr;
+    uint16_t* k_fp8_scale = nullptr;
+    uint16_t* v_fp8_scale = nullptr;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
@@ -318,8 +325,13 @@ bool qsa_kv_q4();
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
+/// Hardware FP8 KV (`--kv fp8` or `--kv fp8_e4m3` / `--kv fp8_e5m2`): 132 B per cell and head; native sm_120.
+void qsa_set_kv_fp8(bool enabled, bool e5m2 = false);
+bool qsa_kv_fp8();
+bool qsa_kv_fp8_e5m2();
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid / kKvFp8 / kKvFp8E5M2).
 inline int qsa_kv_format(const QsaState& st) {
+    if (st.kv_fp8) return st.kv_fp8_e5m2 ? strata::kernels::kKvFp8E5M2 : strata::kernels::kKvFp8;
     if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
