@@ -174,7 +174,7 @@ __global__ void kv_append_fp8_kernel(uint8_t* __restrict__ k_fp8, uint8_t* __res
     if (host.k_fp8 != nullptr) {
         const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
         (is_v ? host.v_fp8 : host.k_fp8)[row * head_dim + g * KV_FP8_GROUP + t] = q;
-        if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
+        if (t == 0) (is_v ? host.v_fp8_scale : host.k_fp8_scale)[row * groups + g] = sbits;
     }
 }
 
@@ -219,11 +219,11 @@ __global__ void kv_append_fp8_batch_kernel(uint8_t* __restrict__ k_fp8, uint8_t*
     }
     if (host.k_fp8 != nullptr) {
         (is_v ? host.v_fp8 : host.k_fp8)[row * head_dim + g * KV_FP8_GROUP + th] = q;
-        if (th == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
+        if (th == 0) (is_v ? host.v_fp8_scale : host.k_fp8_scale)[row * groups + g] = sbits;
     }
     if (stage.k_fp8 != nullptr) {
         (is_v ? stage.v_fp8 : stage.k_fp8)[row * head_dim + g * KV_FP8_GROUP + th] = q;
-        if (th == 0) (is_v ? stage.v_scale : stage.k_scale)[row * groups + g] = sbits;
+        if (th == 0) (is_v ? stage.v_fp8_scale : stage.k_fp8_scale)[row * groups + g] = sbits;
     }
 }
 

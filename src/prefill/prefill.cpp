@@ -1716,6 +1716,11 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
         st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
         st.v_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
+    } else if (q0.kv_fp8) {
+        st.k_fp8 = o.take<uint8_t>(rows * s.head_dim, ok);
+        st.v_fp8 = o.take<uint8_t>(rows * s.head_dim, ok);
+        st.k_fp8_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
+        st.v_fp8_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
     } else {
         st.k_pool = o.take<uint16_t>(rows * s.head_dim, ok);
         st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
@@ -1725,6 +1730,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     strata::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    p.k_fp8 = h.k_fp8; p.v_fp8 = h.v_fp8; p.k_fp8_scale = h.k_fp8_scale; p.v_fp8_scale = h.v_fp8_scale;
     p.page_table = table;
     return p;
 }
