@@ -1148,6 +1148,7 @@ struct Options {
     /// Unset: `--draft dflash2` means none (the owner's order: the DFlash2 and the MTP layer are never loaded together unless asked); `--draft auto` needs both.
     std::string draft_fallback;
     double draft_conf = 0.0;   ///< --draft-conf P: with --draft dflash2 the window ends where the product of the selector's probabilities falls below P (replaces --spec-min-p)
+    bool caddtree = false;     ///< --caddtree: enable CaDDTree active tree verification (default: false, linear DFlash2 mode)
     /// --draft auto (serve): both drafters stay current and each request picks one (its key draft=mtp|dflash2, else draft_rule); the CLI treats auto as dflash2
     bool draft_auto = false;
     std::string draft_rule = "df2";   ///< --draft-rule df2|mtp|learn: what a request without a draft= key gets
@@ -1320,6 +1321,8 @@ void usage() {
                  "                       mtp = load both, the MTP drafts if DFlash2 cannot start (--draft auto always loads both)\n"
                  "                       (the MTP layer's ~0.9 GiB of VRAM goes to the expert cache; --mtp DIR is still needed for DIR/draft_vocab.bin)\n"
                  "  --draft-conf P       with --draft dflash2: end the window where the product of the selector's probabilities falls below P (default 0 = --spec-min-p)\n"
+                 "  --caddtree           enable CaDDTree active tree verification (default: off, linear DFlash2 mode)\n"
+                 "  --no-caddtree        disable CaDDTree active tree verification (default)\n"
                  "  --draft auto         (serve) both drafters stay current; a request picks one: draft=mtp|dflash2, else --draft-rule df2|mtp|learn;\n"
                  "                       MTP requests use --draft-mtp-spec N (default 4) and --draft-mtp-min-p P\n"
                  "  --draft-cap N        the widest verify window with --draft dflash2 (default by card: 8 on Strix Halo / iGPU and on Blackwell cc 12.0 with 48 GB or more, 6 on other Blackwell, --spec as given elsewhere)\n"
@@ -3964,6 +3967,8 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--draft-conf") o.draft_conf = std::clamp(std::atof(next("--draft-conf")), 0.0, 1.0);
+        else if (a == "--caddtree") o.caddtree = true;
+        else if (a == "--no-caddtree") o.caddtree = false;
         else if (a == "--draft-cap") o.draft_cap = std::max(0, std::atoi(next("--draft-cap")));
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
         else if (a == "--control-vector-scaled") {
@@ -4204,6 +4209,15 @@ int main(int argc, char** argv) {
     strata::core::apply_parallel_defaults_cuda(true, o.batch);
     strata::core::apply_gdn_defaults_cuda(true);   // STRATA_GDN_TC=1, STRATA_GDN_CONVL2=2 (owner yes 2026-11-07; was the launcher's GDN_STACK_CUDA)
 #endif
+    if (const char* e = std::getenv("STRATA_ENABLE_CADDTREE")) {
+        if (*e == '1' || *e == 'y' || *e == 'Y' || *e == 't' || *e == 'T') o.caddtree = true;
+        else if (*e == '0' || *e == 'n' || *e == 'N' || *e == 'f' || *e == 'F') o.caddtree = false;
+    }
+    if (const char* e = std::getenv("STRATA_CADDTREE")) {
+        if (*e == '1' || *e == 'y' || *e == 'Y' || *e == 't' || *e == 'T') o.caddtree = true;
+        else if (*e == '0' || *e == 'n' || *e == 'N' || *e == 'f' || *e == 'F') o.caddtree = false;
+    }
+    if (std::getenv("STRATA_DISABLE_CADDTREE") != nullptr) o.caddtree = false;
     if (!o.prefill_cap_warn.empty() && !o.prefill_cap_warn_skip)
         std::fprintf(stderr, "strata: WARNING --prefill %s: prompt chunks of 8192 tokens or more crashed the engine "
                              "on Windows HIP (RX 7900 XTX: the commit charge jumped ~70 GB, exit code 0xC0000409, "
@@ -20456,8 +20470,7 @@ int main(int argc, char** argv) {
                 }
                 strata::spec::CaDDPlan cadd_plan;
                 bool tree_round = false;
-                if (req_df2 && !first_window && !merged && !from_sfx && chain_n == 0 && fol == nullptr &&
-                    std::getenv("STRATA_DISABLE_CADDTREE") == nullptr) {
+                if (o.caddtree && req_df2 && !first_window && !merged && !from_sfx && chain_n == 0 && fol == nullptr) {
                     cadd_plan = strata::spec::plan_caddtree(
                         /*num_prim_drafts=*/(int) std::min<size_t>(drafts.size(), (size_t) (T - 1)),
                         /*prim_tokens=*/drafts.data(),
@@ -20951,12 +20964,19 @@ int main(int argc, char** argv) {
                 ++b.n[w];
             }
             if (draft_log && use_df2) {
-                const double tree_rate = df2_tree_rej > 0 ? (100.0 * df2_tree_hits / (double) df2_tree_rej) : 0.0;
                 const double acc_rate = (double) draft_accepted / (double) std::max<int64_t>(1, rounds - rounds_at_start);
-                std::fprintf(stderr, "strata draft: request %lld drafter=%s window<=%d tokens=%lld rounds=%lld (accept %.2f/rnd) tree_alt=%d/%d (%.1f%%) decode_ms=%.1f keep_ms=%.1f (%.3f per round)\n",
-                             (long long) ++draft_req_count, req_df2 ? "dflash2" : "mtp", S_mtp, (long long) produced_n, (long long) (rounds - rounds_at_start),
-                             acc_rate, df2_tree_hits, df2_tree_rej, tree_rate, decode_ms, keep_ms,
-                             rounds > rounds_at_start ? keep_ms / (double) (rounds - rounds_at_start) : 0.0);
+                if (o.caddtree || df2_tree_hits > 0) {
+                    const double tree_rate = df2_tree_rej > 0 ? (100.0 * df2_tree_hits / (double) df2_tree_rej) : 0.0;
+                    std::fprintf(stderr, "strata draft: request %lld drafter=%s window<=%d tokens=%lld rounds=%lld (accept %.2f/rnd) tree_alt=%d/%d (%.1f%%) decode_ms=%.1f keep_ms=%.1f (%.3f per round)\n",
+                                 (long long) ++draft_req_count, req_df2 ? "dflash2" : "mtp", S_mtp, (long long) produced_n, (long long) (rounds - rounds_at_start),
+                                 acc_rate, df2_tree_hits, df2_tree_rej, tree_rate, decode_ms, keep_ms,
+                                 rounds > rounds_at_start ? keep_ms / (double) (rounds - rounds_at_start) : 0.0);
+                } else {
+                    std::fprintf(stderr, "strata draft: request %lld drafter=%s window<=%d tokens=%lld rounds=%lld (accept %.2f/rnd) decode_ms=%.1f keep_ms=%.1f (%.3f per round)\n",
+                                 (long long) ++draft_req_count, req_df2 ? "dflash2" : "mtp", S_mtp, (long long) produced_n, (long long) (rounds - rounds_at_start),
+                                 acc_rate, decode_ms, keep_ms,
+                                 rounds > rounds_at_start ? keep_ms / (double) (rounds - rounds_at_start) : 0.0);
+                }
             }
             // --draft-costs: at a request's end, a learning stretch that is long enough becomes this machine's table (from the next request
             // on); one that looks disturbed (a load beside the engine, a stall) is dropped and learned again
@@ -22732,8 +22752,7 @@ int main(int argc, char** argv) {
 
             strata::spec::CaDDPlan cadd_plan;
             bool tree_round = false;
-            if (use_df2 && !first_window && !from_sfx && chain_n == 0 && draft_on && follow.empty() &&
-                std::getenv("STRATA_DISABLE_CADDTREE") == nullptr) {
+            if (o.caddtree && use_df2 && !first_window && !from_sfx && chain_n == 0 && draft_on && follow.empty()) {
                 cadd_plan = strata::spec::plan_caddtree(
                     /*num_prim_drafts=*/(int) std::min<size_t>(drafts.size(), (size_t) (T - 1)),
                     /*prim_tokens=*/drafts.data(),
@@ -23084,10 +23103,15 @@ int main(int argc, char** argv) {
         (void) pool_ms0;
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2 && df2.rounds > 0) {
-            const double tree_rate = df2_tree_rej > 0 ? (100.0 * df2_tree_hits / (double) df2_tree_rej) : 0.0;
-            std::printf("%-24s %.3f ms/round drafting (%lld rounds, GPU %.3f), %.0f MiB of VRAM  tree_alt=%d/%d (%.1f%%)\n", "dflash2", df2.ms_draft / (double) df2.rounds,
-                        (long long) df2.rounds, df2.ms_gpu / (double) df2.rounds, (double) df2.vram_bytes() / 1048576.0,
-                        df2_tree_hits, df2_tree_rej, tree_rate);
+            if (o.caddtree || df2_tree_hits > 0) {
+                const double tree_rate = df2_tree_rej > 0 ? (100.0 * df2_tree_hits / (double) df2_tree_rej) : 0.0;
+                std::printf("%-24s %.3f ms/round drafting (%lld rounds, GPU %.3f), %.0f MiB of VRAM  tree_alt=%d/%d (%.1f%%)\n", "dflash2", df2.ms_draft / (double) df2.rounds,
+                            (long long) df2.rounds, df2.ms_gpu / (double) df2.rounds, (double) df2.vram_bytes() / 1048576.0,
+                            df2_tree_hits, df2_tree_rej, tree_rate);
+            } else {
+                std::printf("%-24s %.3f ms/round drafting (%lld rounds, GPU %.3f), %.0f MiB of VRAM\n", "dflash2", df2.ms_draft / (double) df2.rounds,
+                            (long long) df2.rounds, df2.ms_gpu / (double) df2.rounds, (double) df2.vram_bytes() / 1048576.0);
+            }
         } else
 #endif
         if (use_mtp && rounds > 0)
