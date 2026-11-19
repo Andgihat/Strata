@@ -120,6 +120,20 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// DFlash2 Tree-Attention Parallel Verification:
+    /// Evaluates primary trunk (T_prim tokens: root + T_prim-1 drafts) and alternative branch (B tokens: alt_dd[0..B-1])
+    /// in parallel in ONE captured graph.
+    /// tokens layout:
+    ///   tokens[0 .. T_prim-1]: trunk (root at pos0, followed by drafts)
+    ///   tokens[T_prim .. T_prim+B-1]: branch (alt_dd[0..B-1] branching from root)
+    /// out layout:
+    ///   out[0 .. T_prim-1]: argmax predictions for trunk
+    ///   out[T_prim .. T_prim+B-1]: argmax predictions for branch
+    bool run_tree(int T_prim, int B, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                  int32_t* out, std::string& err);
+    /// When the primary draft is rejected at root (out[0] == alt_dd[0]) and B_keep branch tokens are accepted,
+    /// commits the verified branch activations into the session state.
+    bool commit_tree_branch(int B_keep, const int32_t* branch_tokens, std::string& err);
     /// --lookup-max-t: capture the T-token window graph now instead of on first use.  false with `no_vram` set: the
     /// graph found no VRAM - nothing else changed, and a smaller window can run instead.  A layer split's stages
     /// keep the capture on first use (true, nothing done).
@@ -673,6 +687,19 @@ private:
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
     bool capture_oom_ = false;          // the last capture's instantiate found no VRAM (prepare)
     cudaGraphExec_t commit_exec_ = nullptr;
+
+    // DFlash2 Tree verification
+    bool tree_rec_ = false;
+    int tree_T_prim_ = 0;
+    int tree_B_ = 0;
+    cudaGraphExec_t exec_tree_[strata::kernels::kVerifyLongT + 1][strata::kernels::kVerifyMaxT + 1] = {};
+    cudaGraphExec_t exec_tree_nr_[strata::kernels::kVerifyLongT + 1][strata::kernels::kVerifyMaxT + 1] = {};
+    bool capture_tree(int T_prim, int B, std::string& err);
+    void stage_tree_inputs(int T_prim, int B, const int32_t* tokens, int64_t pos0);
+    float* conv_branch_ = nullptr;
+    float* state_branch_ = nullptr;
+    float* branch_k_L_ = nullptr;
+    float* branch_v_L_ = nullptr;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

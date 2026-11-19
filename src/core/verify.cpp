@@ -729,6 +729,12 @@ Verifier::~Verifier() {
     for (auto& row : exec_nr_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
+    for (auto& row : exec_tree_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
+    for (auto& row : exec_tree_nr_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -1120,6 +1126,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        conv_branch_ = b.take<float>(3 * C);
+        state_branch_ = b.take<float>((uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size);
+        branch_k_L_ = b.take<float>(nQ * (uint64_t) strata::kernels::kVerifyMaxT * NKV * HD);
+        branch_v_L_ = b.take<float>(nQ * (uint64_t) strata::kernels::kVerifyMaxT * NKV * HD);
     };
     Bump count;
     carve(count);
@@ -1367,7 +1377,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     // a batch window is one group; a window past kVerifyMaxT tokens is always two (--lookup-max-t: each group holds
     // at most kVerifyMaxT, what the per-group kernels and the CPU experts take)
-    const int G = ((split_ && T >= 2) || T > kVerifyMaxT) && !batch_rec_ ? 2 : 1;
+    const int G = ((split_ && T >= 2) || T > kVerifyMaxT) && !batch_rec_ && !tree_rec_ ? 2 : 1;
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
@@ -1721,6 +1731,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
+                if (tree_rec_) {
+                    gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, tree_T_prim_, cs, 0, false);
+                    strata::kernels::gdn_conv_branch_hist(conv, qkv, conv_branch_, (int) C, cs);
+                    gdn_conv_l2_multi(conv_branch_, qkv + (size_t) tree_T_prim_ * C, (const float*) wc->data,
+                                      hb + (size_t) tree_T_prim_ * C, (int) C, (int) (2 * HK), EPS, tree_B_, cs, 0, false);
+                } else
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
                         const int first = t;
@@ -1768,6 +1784,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
                     return v != nullptr && std::atoi(v) != 0;
                 }();
+                if (tree_rec_) {
+                    strata::kernels::gdn_step_replay_one(state, hb, (int) C, gate, beta, (int) HK, (int) HV, state_branch_, cs);
+                    strata::kernels::GdnGroups gg;
+                    gg.n = 2;
+                    gg.state[0] = state;
+                    gg.first[0] = 0;
+                    gg.ntok[0] = tree_T_prim_;
+                    gg.keep[0] = nullptr;
+                    gg.state[1] = state_branch_;
+                    gg.first[1] = tree_T_prim_;
+                    gg.ntok[1] = tree_B_;
+                    gg.keep[1] = nullptr;
+                    strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
+                                                          y_, (int) HK, (int) HV, false, cs);
+                } else
                 if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
@@ -1894,13 +1925,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
                 };
                 auto idx_append = [&](cudaStream_t ns) {
+                    const int n_app = tree_rec_ ? tree_T_prim_ : n;
                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
-                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                        n_app, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                         rope_scaling(), ns);
                     } else {
-                        for (int t = tb; t < te; ++t) {
+                        for (int t = tb; t < tb + n_app; ++t) {
                             const QsaState& sx = slot_ss(t).qsa_states[qi];
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
                             native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
@@ -2006,6 +2038,39 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 8, grp);
                 if (!sidem) idx_snap(cs);
+                if (tree_rec_) {
+                    const int32_t* step_b = step_;
+                    const float* kc_b = kcur_;
+                    const float* vc_b = vcur_;
+                    const int n_trunk = tree_T_prim_;
+                    if (st.kv_hybrid) {
+                        const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                        const bool mirror = st.host.present();
+                        kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_b, kStepCount,
+                                           kc_b, kc_b, (int) (NKV * HD), n_trunk, s, cs, mirror ? &hk : nullptr);
+                        kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n_trunk, vc_b, vc_b, s, cs,
+                                           mirror ? &hv : nullptr);
+                    } else if (st.kv_q4)
+                        kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n_trunk, kc_b, vc_b, s, cs,
+                                           &st.host);
+                    else if (st.kv_fp8)
+                        kv_append_fp8_steps(st.k_fp8, st.v_fp8, st.k_fp8_scale, st.v_fp8_scale, st.page_table, step_b, kStepCount,
+                                            kc_b, vc_b, (int) (NKV * HD), n_trunk, s, cs, &st.host, st.kv_fp8_e5m2);
+                    else if (st.kv_int8)
+                        kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
+                                           kc_b, vc_b, (int) (NKV * HD), n_trunk, s, cs, &st.host);
+                    else
+                        for (int t = 0; t < n_trunk; ++t)
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
+                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+
+                    cudaMemcpyAsync(branch_k_L_ + (size_t) qi * (size_t) strata::kernels::kVerifyMaxT * NKV * HD,
+                                    kcur_ + (size_t) tree_T_prim_ * NKV * HD,
+                                    (size_t) tree_B_ * NKV * HD * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                    cudaMemcpyAsync(branch_v_L_ + (size_t) qi * (size_t) strata::kernels::kVerifyMaxT * NKV * HD,
+                                    vcur_ + (size_t) tree_T_prim_ * NKV * HD,
+                                    (size_t) tree_B_ * NKV * HD * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                } else
                 // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
                 // batch's rows each have their own K/V, so that case keeps the loop)
                 if (dec_batch && !g_no_batch_kv && !batch_rec_) {
@@ -2934,6 +2999,64 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
+bool Verifier::capture_tree(int T_prim, int B, std::string& err) {
+    if (T_prim < 1 || T_prim > strata::kernels::kVerifyLongT || B < 1 || B > strata::kernels::kVerifyMaxT) {
+        err = "verify capture_tree: invalid T_prim or B";
+        return false;
+    }
+    const int T = T_prim + B;
+    if (T > max_t_) {
+        err = "verify capture_tree: T_prim + B (" + std::to_string(T) + ") exceeds max_t (" + std::to_string(max_t_) + ")";
+        return false;
+    }
+    cudaGraphExec_t& exec_t = ar_off_ ? exec_tree_nr_[T_prim][B] : exec_tree_[T_prim][B];
+    if (exec_t != nullptr) return true;
+
+    const auto cap_t0 = std::chrono::steady_clock::now();
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+        std::fprintf(stderr, "strata verify: capturing tree window T_prim=%d, B=%d (total T=%d, %zu MiB free)\n",
+                     T_prim, B, T, free_b >> 20);
+
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: begin tree capture failed";
+        return false;
+    }
+
+    tree_rec_ = true;
+    tree_T_prim_ = T_prim;
+    tree_B_ = B;
+
+    std::string rerr;
+    const bool ok = record_window(T, cs_, rerr);
+
+    tree_rec_ = false;
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        err = rerr;
+        return false;
+    }
+    if (ce != cudaSuccess) {
+        err = std::string("verify: end tree capture: ") + cudaGetErrorString(ce);
+        return false;
+    }
+
+    unsigned long long iflags = 0;
+    const bool made = instantiate_evicting(exec_t, graph, {}, "verify tree: instantiate: ", err, T, iflags);
+    cudaGraphDestroy(graph);
+    if (!made) return false;
+
+    const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
+    const cudaError_t us = cudaStreamSynchronize(cs_);
+    std::fprintf(stderr, "strata verify: captured tree window T_prim=%d, B=%d in %.1f ms\n",
+                 T_prim, B, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cap_t0).count());
+    if (ue != cudaSuccess || us != cudaSuccess) (void) cudaGetLastError();
+    return true;
+}
+
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
     using namespace strata::kernels;
@@ -3098,6 +3221,55 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     strata_store_fence();
     last_t_ = T;
     if (rs_on_ && T >= 1 && T <= 16) ++rs_win_[T];
+    last_pos0_ = pos0;
+    for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+    staged_ = true;
+}
+
+void Verifier::stage_tree_inputs(int T_prim, int B, const int32_t* tokens, int64_t pos0) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const QsaShapes s = shapes_of(g);
+    int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
+    int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
+    const int T = T_prim + B;
+
+    // Trunk: t in [0, T_prim), positions pos0 + t
+    for (int t = 0; t < T_prim; ++t) {
+        h_tok_[t] = tokens[t];
+        qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
+        const int32_t pos_t = (int32_t) (pos0 + t);
+        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
+        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+    }
+
+    // Branch: b in [0, B), index t = T_prim + b, positions pos0 + 1 + b
+    for (int b = 0; b < B; ++b) {
+        const int t = T_prim + b;
+        h_tok_[t] = tokens[t];
+        const int64_t pos_b = pos0 + 1 + b;
+        qsa_step_fill(h_step_ + t * kStepCount, pos_b, s);
+        const int32_t pos_t = (int32_t) pos_b;
+        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
+        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+    }
+
+    *(volatile uint32_t*) h_seq_ = 0;
+    *(volatile uint32_t*) h_flag_ = 0;
+    *(volatile uint32_t*) h_flagA_ = 0;
+    *(volatile uint32_t*) h_flagB_ = 0;
+    if (hflag_out_h_ != nullptr) *(volatile uint32_t*) hflag_out_h_ = 0;
+    if (herr_h_ != nullptr) *(volatile uint32_t*) herr_h_ = 0;
+    if (hdrop_h_ != nullptr) *(volatile uint32_t*) hdrop_h_ = 0;
+
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata_store_fence();
+
+    last_t_ = T;
+    tree_T_prim_ = T_prim;
+    tree_B_ = B;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     staged_ = true;
@@ -3720,6 +3892,136 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     return true;
 }
 
+bool Verifier::run_tree(int T_prim, int B, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                        int32_t* out, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    last_batch_ = false;
+    const int T = T_prim + B;
+    if (T_prim < 1 || B < 1 || T > max_t_) {
+        err = "verify run_tree: window size out of range";
+        return false;
+    }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    if (pos0 + T_prim > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+
+    refresh_ar();
+    sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
+    if (!capture_tree(T_prim, B, err) || !capture_commit(err)) return false;
+
+    stage_tree_inputs(T_prim, B, tokens, pos0);
+    staged_ = false;
+
+    const bool do_ple = ss.ple.ready() && ple_stage();
+    uint32_t ple_rows[kVerifyLongT * PLE_N_HEADS];
+    if (do_ple) {
+        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+        for (int t = 0; t < T_prim; ++t) {
+            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = tokens[t];
+            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+        }
+        int32_t b_prev[2] = {ss.ple_prev[1], tokens[0]};
+        for (int b = 0; b < B; ++b) {
+            const int t = T_prim + b;
+            ngram_rows(&tokens[t], b_prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
+            b_prev[0] = b_prev[1];
+            b_prev[1] = tokens[t];
+            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+        }
+    }
+
+    bool flag_raised = false;
+    if (ar_on() && (early_ple_flag_mode() == 1 || early_ple_flag_mode() == 2)) {
+        if (do_ple) {
+            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata_store_fence();
+        }
+        *(volatile uint32_t*) h_flag_ = 1;
+        flag_raised = true;
+    }
+
+    cudaGraphExec_t& exec_t = ar_off_ ? exec_tree_nr_[T_prim][B] : exec_tree_[T_prim][B];
+    strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
+    const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
+    if (le != cudaSuccess) { err = std::string("verify tree: launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+
+    volatile uint32_t* const seq = h_seq_;
+    volatile uint32_t* const flag = h_flag_;
+    const int64_t steps = (le_ - lb_);
+
+    if (ar_on()) {
+        if (flag_raised) {
+            // flag already raised
+        } else if (do_ple) {
+            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata_store_fence();
+            *flag = 1;
+        } else {
+            *flag = 1;
+        }
+    } else {
+        for (int64_t k = 0; k < steps; ++k) {
+            const int64_t l = lb_ + k;
+            const uint32_t want = (uint32_t) (k + 1);
+            while (*seq < want) {
+                strata_cpu_pause();
+            }
+            strata_load_fence();
+            cur_layer_ = want - 1;
+            set_plan_slot(0);
+            if (pool != nullptr)
+                pool(user, h_x_, h_ids_, T, ss.k, h_ymiss_, l);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata_store_fence();
+            if (*(volatile uint32_t*) h_flagA_ != want) {
+                sink_.counts[0] = 0; sink_.counts[1] = 0; sink_.counts[2] = 0;
+                sink_.start[0] = 0; sink_.start2[0] = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile uint32_t*) h_flagA_ = want;
+                raise_flag_b_ordered(want);
+            }
+            if (k == 0 && do_ple) {
+                if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                strata_store_fence();
+            }
+            *flag = want;
+        }
+    }
+
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify tree: ") + cudaGetErrorString(se); return false; }
+    if (copy_used_) {
+        cudaStreamSynchronize(copy_);
+        copy_used_ = false;
+    }
+
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) pos0;
+        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = "verify tree: head sampling failed";
+            return false;
+        }
+    }
+
+    for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+
+    ++windows;
+    progress_at("decode");
+    progress_beat();
+    return true;
+}
+
 // set_pcie_balance: each stamped step's times into the model's fits (PcieModel::sample), solved once a window.
 void Verifier::pcie_balance_window(int64_t steps, int G) {
     const volatile unsigned long long* st = h_bal_;
@@ -3950,6 +4252,90 @@ bool Verifier::commit(int n_keep, std::string& err) {
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
+}
+
+bool Verifier::commit_tree_branch(int B_keep, const int32_t* branch_tokens, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    if (B_keep < 1 || B_keep > tree_B_) {
+        err = "verify commit_tree_branch: B_keep (" + std::to_string(B_keep) + ") out of range [1, " +
+              std::to_string(tree_B_) + "]";
+        return false;
+    }
+    const ModelGeometry& g = *g_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t HD = g.head_dim;
+    const int64_t NKV = g.n_head_kv;
+    const int64_t C = g.ssm_conv_channels;
+    const int64_t HV = g.ssm_v_heads;
+    const int64_t ID = g.idx_key_dim;
+    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+
+    int64_t qsa_index = 0, gdn_index = 0;
+    for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+
+    int64_t n_gdn = 0, n_qsa = 0;
+    for (int64_t l = lb_; l < le_; ++l) {
+        if (is_qsa_layer(g, l)) ++n_qsa;
+        else ++n_gdn;
+    }
+
+    const int32_t* step_b = step_ + (size_t) tree_T_prim_ * strata::kernels::kStepCount;
+    for (int64_t l = lb_, qi = qsa_index; l < le_; ++l) {
+        if (!is_qsa_layer(g, l)) continue;
+        const QsaState& st = ss_->qsa_states[qi];
+        const float* kc_b = branch_k_L_ + (size_t) qi * (size_t) strata::kernels::kVerifyMaxT * NKV * HD;
+        const float* vc_b = branch_v_L_ + (size_t) qi * (size_t) strata::kernels::kVerifyMaxT * NKV * HD;
+        if (st.kv_hybrid) {
+            const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+            const bool mirror = st.host.present();
+            kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_b,
+                               strata::kernels::kStepCount, kc_b, kc_b, (int) (NKV * HD), B_keep, s, cs_,
+                               mirror ? &hk : nullptr);
+            kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, strata::kernels::kStepCount,
+                               B_keep, vc_b, vc_b, s, cs_, mirror ? &hv : nullptr);
+        } else if (st.kv_q4) {
+            kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, strata::kernels::kStepCount,
+                               B_keep, kc_b, vc_b, s, cs_, &st.host);
+        } else if (st.kv_fp8) {
+            kv_append_fp8_steps(st.k_fp8, st.v_fp8, st.k_fp8_scale, st.v_fp8_scale, st.page_table, step_b,
+                                strata::kernels::kStepCount, kc_b, vc_b, (int) (NKV * HD), B_keep, s, cs_,
+                                &st.host, st.kv_fp8_e5m2);
+        } else if (st.kv_int8) {
+            kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b,
+                               strata::kernels::kStepCount, kc_b, vc_b, (int) (NKV * HD), B_keep, s, cs_,
+                               &st.host);
+        } else {
+            for (int b = 0; b < B_keep; ++b) {
+                kv_append_step(st.k_pool, st.v_pool, st.page_table, step_b + b * strata::kernels::kStepCount,
+                               kc_b + b * NKV * HD, vc_b + b * NKV * HD, s, cs_, &st.host);
+            }
+        }
+        ++qi;
+    }
+
+    strata::kernels::copy_branch_activations(
+        qkv_L_, h_L_, gate_L_, beta_L_, idx_raw_L_, hist_snap_,
+        (int) n_gdn, (int) n_qsa, (int) C, (int) HV, (int) ID, (int) HS,
+        max_t_, tree_T_prim_, B_keep, cs_);
+
+    if (tap_dev_ != nullptr && tap_on_ && !tap_layers_.empty()) {
+        const int64_t nt = (int64_t) tap_layers_.size();
+        const size_t row_bytes = (size_t) nt * (size_t) g.n_embd * sizeof(float);
+        cudaMemcpyAsync(tap_dev_ + 1 * nt * g.n_embd,
+                        tap_dev_ + (size_t) tree_T_prim_ * nt * g.n_embd,
+                        (size_t) B_keep * row_bytes, cudaMemcpyDeviceToDevice, cs_);
+    }
+
+    for (int b = 0; b < B_keep; ++b) last_tokens_[1 + b] = branch_tokens[b];
+    last_t_ = 1 + B_keep;
+
+    if (next_ != nullptr) {
+        for (int b = 0; b < B_keep; ++b) next_->last_tokens_[1 + b] = branch_tokens[b];
+        next_->last_t_ = 1 + B_keep;
+    }
+
+    return commit(1 + B_keep, err);
 }
 
 bool Verifier::commit_deferred() const {

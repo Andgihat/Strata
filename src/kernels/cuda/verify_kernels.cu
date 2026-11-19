@@ -95,6 +95,15 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
     hist[c * 3 + 2] = seq[2];
 }
 
+__global__ void gdn_conv_branch_hist_kernel(const float* __restrict__ conv, const float* __restrict__ qkv,
+                                            float* __restrict__ dst, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    dst[c * 3 + 0] = conv[c * 3 + 1];
+    dst[c * 3 + 1] = conv[c * 3 + 2];
+    dst[c * 3 + 2] = qkv[c];
+}
+
 template <int MAX_T = kVerifyNarrowT, bool EXACT_T = false>
 __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restrict__ x, const uint16_t* __restrict__ wa,
                                                           const uint16_t* __restrict__ wb,
@@ -548,6 +557,54 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* _
     if (n_keep != nullptr && n > 0) {
 #pragma unroll
         for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+    }
+}
+
+__global__ void __launch_bounds__(GS_COLS * RG) gdn_step_replay_one_kernel(
+    const float* __restrict__ state_src, const float* __restrict__ hbuf, int C,
+    const float* __restrict__ gate, const float* __restrict__ beta,
+    int h_k, int h_v, float* __restrict__ state_dst) {
+    __shared__ float sk[S];
+    __shared__ float red[RG][GS_COLS];
+    const int head = blockIdx.x;
+    const int c0 = blockIdx.y * GS_COLS;
+    const int lc = threadIdx.x;
+    const int col = c0 + lc;
+    const int rg = threadIdx.y;
+    const int tid = rg * GS_COLS + lc;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+
+    const float gv = gate[head];
+    const float bv = beta[head];
+    const float vv = hbuf[2 * qk + head * S + col];
+    const float kn = hbuf[qk + qh * S + tid];
+
+    const size_t row_stride = (size_t) h_v * S;
+    const float* src_base = state_src + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    float* dst_base = state_dst + ((size_t) (rg * RPG) * h_v + head) * S + col;
+
+    float s[RPG];
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = src_base[r * row_stride];
+
+    __syncthreads();
+    sk[tid] = kn;
+    __syncthreads();
+
+    const float g = __expf(gv);
+    float kv = 0.0f;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+    red[rg][lc] = kv;
+    __syncthreads();
+
+    const float kv_col = red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc];
+    const float delta = (vv - g * kv_col) * bv;
+
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) {
+        dst_base[r * row_stride] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
     }
 }
 // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) per head and token: gdn_step_norm_multi_kernel's tail with its
@@ -1171,6 +1228,58 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
     gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, qkv,
                                                                                                  channels, n_keep);
     check("gdn_conv_commit");
+}
+
+void gdn_conv_branch_hist(const float* conv, const float* qkv, float* dst, int channels, void* stream) {
+    if (!conv || !qkv || !dst || channels <= 0) return;
+    const int b = 256;
+    const int g = (channels + b - 1) / b;
+    gdn_conv_branch_hist_kernel<<<g, b, 0, (cudaStream_t) stream>>>(conv, qkv, dst, channels);
+    check("gdn_conv_branch_hist");
+}
+
+void gdn_step_replay_one(const float* state_src, const float* hbuf, int conv_channels,
+                         const float* gate, const float* beta, int h_k, int h_v,
+                         float* state_dst, void* stream) {
+    if (!state_src || !hbuf || !gate || !beta || !state_dst || h_k <= 0 || h_v <= 0) return;
+    const dim3 grid((unsigned) h_v, S / GS_COLS), block(GS_COLS, RG);
+    gdn_step_replay_one_kernel<<<grid, block, 0, (cudaStream_t) stream>>>(
+        state_src, hbuf, conv_channels, gate, beta, h_k, h_v, state_dst);
+    check("gdn_step_replay_one");
+}
+
+void copy_branch_activations(float* qkv_L, float* h_L, float* gate_L, float* beta_L, float* idx_raw_L,
+                             float* hist_snap, int n_gdn, int n_qsa, int C, int HV, int ID, int HS,
+                             int MT, int T_prim, int B_keep, void* stream) {
+    if (B_keep <= 0 || T_prim <= 0) return;
+    cudaStream_t cs = (cudaStream_t) stream;
+    for (int l = 0; l < n_gdn; ++l) {
+        float* qkv_base = qkv_L + (size_t) l * MT * C;
+        cudaMemcpyAsync(qkv_base + 1 * C, qkv_base + (size_t) T_prim * C,
+                        (size_t) B_keep * C * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+
+        float* h_base = h_L + (size_t) l * MT * C;
+        cudaMemcpyAsync(h_base + 1 * C, h_base + (size_t) T_prim * C,
+                        (size_t) B_keep * C * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+
+        float* gate_base = gate_L + (size_t) l * MT * HV;
+        cudaMemcpyAsync(gate_base + 1 * HV, gate_base + (size_t) T_prim * HV,
+                        (size_t) B_keep * HV * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+
+        float* beta_base = beta_L + (size_t) l * MT * HV;
+        cudaMemcpyAsync(beta_base + 1 * HV, beta_base + (size_t) T_prim * HV,
+                        (size_t) B_keep * HV * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    }
+    for (int l = 0; l < n_qsa; ++l) {
+        float* idx_base = idx_raw_L + (size_t) l * MT * ID;
+        cudaMemcpyAsync(idx_base + 1 * ID, idx_base + (size_t) T_prim * ID,
+                        (size_t) B_keep * ID * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    }
+    if (hist_snap != nullptr) {
+        cudaMemcpyAsync(hist_snap + 1 * HS, hist_snap + (size_t) T_prim * HS,
+                        (size_t) B_keep * HS * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    }
+    check("copy_branch_activations");
 }
 
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,

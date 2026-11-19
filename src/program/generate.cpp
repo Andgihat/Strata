@@ -12591,8 +12591,9 @@ int main(int argc, char** argv) {
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (batch_df2) ver.set_batch_taps(true);
 #endif
+        const int serve_max_t = use_df2 ? std::max(batch_max_t(), (int) strata::kernels::kVerifyMaxT) : batch_max_t();
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_max_t(), err) ||
+                      serve_max_t, err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -19462,7 +19463,7 @@ int main(int argc, char** argv) {
             int32_t x = (int32_t) ids[(size_t) p];
             // (the drafter writes max_t - 1 drafts: 8 rows with --pipeline-windows 2)
             const size_t DS = (size_t) std::max(S, use_mtp ? mtp.max_t() : 0);
-            const size_t WS = (size_t) std::max(S, merge_T);
+            const size_t WS = (size_t) std::max({(int) S, merge_T, (int) strata::kernels::kVerifyMaxT});
             std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
             std::vector<float> dprob(DS, 0.0f);
             std::array<float, 8> dwin_s{};   // the probabilities the current window was chosen from (STRATA_SPEC_COST)
@@ -20644,8 +20645,22 @@ int main(int argc, char** argv) {
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                static const bool df2_tree_env = [] {
+                    const char* v = std::getenv("STRATA_DF2_TREE");
+                    return !v || std::atoi(v) != 0;
+                }();
+                int B = 0;
+                if (req_df2 && !from_sfx && !first_window && !merged && df2_alt_div == 0 && df2_tree_env) {
+                    while (B < 5 && B < (int) df2_alt_d.size() && df2_alt_d[(size_t) B] >= 0) ++B;
+                    if (T + B > (int) strata::kernels::kVerifyMaxT) B = 0;
+                    for (int b = 0; b < B; ++b) window[(size_t) (T + b)] = df2_alt_d[(size_t) b];
+                }
+                const bool tree_round = B > 0;
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
-                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                const bool run_ok = tree_round
+                    ? ver.run_tree(T, B, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err)
+                    : ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err);
+                if (!run_ok || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -20681,6 +20696,21 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                bool tree_accepted = false;
+                int b_acc = 0;
+                if (tree_round && a == 0 && outv[0] == df2_alt_d[0]) {
+                    b_acc = 1;
+                    while (b_acc < B && (size_t) b_acc < df2_alt_d.size() &&
+                           df2_alt_d[(size_t) b_acc] == outv[(size_t) (T + b_acc - 1)]) {
+                        ++b_acc;
+                    }
+                    for (int b = 1; b <= b_acc; ++b) {
+                        outv[(size_t) b] = outv[(size_t) (T + b - 1)];
+                    }
+                    a = b_acc;
+                    tree_accepted = true;
+                    ++df2_tree_hits;
+                }
                 if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are the accepted tokens)
                     std::vector<int32_t> fol_tg((size_t) a + 1, -1);
                     for (int i = 0; i <= a; ++i) {
@@ -20708,7 +20738,7 @@ int main(int argc, char** argv) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
-                if (req_df2 && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
+                if (req_df2 && !from_sfx && !first_window && a < T_mtp - 1 && a < 8 && !tree_round) {
                     ++df2_tree_rej;
                     if (df2_alt_div >= 0 && (size_t) a < df2_alt_d.size() && df2_alt_d[(size_t) a] == outv[(size_t) a]) {
                         ++df2_tree_hits;
@@ -20720,12 +20750,16 @@ int main(int argc, char** argv) {
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
                     adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                const bool commit_ok = tree_accepted
+                    ? ver.commit_tree_branch(b_acc, df2_alt_d.data(), err)
+                    : ver.commit(a + 1, err);
+                if (!commit_ok) {
                     exit_if_gpu_fatal(err);
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (!tree_accepted && tree_round && a == 0) ++df2_tree_rej;
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
@@ -22074,7 +22108,8 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) ver.set_taps(df2.tap_layers());
 #endif
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+        const int ver_max_t = use_df2 ? std::max(o.spec, (int) strata::kernels::kVerifyMaxT) : o.spec;
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ver_max_t, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -22427,8 +22462,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
-        std::vector<uint8_t> fdiff((size_t) o.spec, 0);
+        const size_t WS = (size_t) std::max(o.spec, (int) strata::kernels::kVerifyMaxT);
+        std::vector<int32_t> window(WS), outv(WS);
+        std::vector<uint8_t> fdiff(WS, 0);
         std::FILE* hashes = o.window_hashes.empty() ? nullptr : std::fopen(o.window_hashes.c_str(), "w");
         if (!o.window_hashes.empty() && hashes == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.window_hashes.c_str());
@@ -22715,7 +22751,21 @@ int main(int argc, char** argv) {
             else if (strata::spec::mtp_q_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp) && o.spec_corrupt <= 0)
                 ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
             const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
-            if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
+            static const bool df2_tree_env = [] {
+                const char* v = std::getenv("STRATA_DF2_TREE");
+                return !v || std::atoi(v) != 0;
+            }();
+            int B = 0;
+            if (use_df2 && !from_sfx && !first_window && df2_alt_div == 0 && df2_tree_env) {
+                while (B < 5 && B < (int) df2_alt_d.size() && df2_alt_d[(size_t) B] >= 0) ++B;
+                if (T + B > (int) strata::kernels::kVerifyMaxT) B = 0;
+                for (int b = 0; b < B; ++b) window[(size_t) (T + b)] = df2_alt_d[(size_t) b];
+            }
+            const bool tree_round = B > 0;
+            const bool run_ok = tree_round
+                ? ver.run_tree(T, B, window.data(), p, decode_pool_fn, &drive, outv.data(), err)
+                : ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err);
+            if (!run_ok) {
                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs
                 // out of memory the window gets one row narrower (the widths below it are already captured) instead of the run failing.
                 if (T > 2 && !first_window && !gated_proposal && err.find("out of memory") != std::string::npos) {
@@ -22754,6 +22804,21 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            bool tree_accepted = false;
+            int b_acc = 0;
+            if (tree_round && a == 0 && outv[0] == df2_alt_d[0]) {
+                b_acc = 1;
+                while (b_acc < B && (size_t) b_acc < df2_alt_d.size() &&
+                       df2_alt_d[(size_t) b_acc] == outv[(size_t) (T + b_acc - 1)]) {
+                    ++b_acc;
+                }
+                for (int b = 1; b <= b_acc; ++b) {
+                    outv[(size_t) b] = outv[(size_t) (T + b - 1)];
+                }
+                a = b_acc;
+                tree_accepted = true;
+                ++df2_tree_hits;
+            }
             const bool initial_round = first_window;   // a single-row window: no proposal to learn from
             if (first_window) {
                 first_window = false;
@@ -22776,17 +22841,21 @@ int main(int argc, char** argv) {
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
                 adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
             strata::core::progress_at("spec loop: commit", (int64_t) T);
-            if (!ver.commit(a + 1, err)) {
+            const bool commit_ok = tree_accepted
+                ? ver.commit_tree_branch(b_acc, df2_alt_d.data(), err)
+                : ver.commit(a + 1, err);
+            if (!commit_ok) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            if (!tree_accepted && tree_round && a == 0) ++df2_tree_rej;
             ++rounds;
             if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
             drafts_total += T - 1;
             drafts_ok += a;
             ++accepted_hist[(size_t) a];
-            if (use_df2 && !from_sfx && !initial_round && a < T - 1 && a < 8) {
+            if (use_df2 && !from_sfx && !initial_round && a < T - 1 && a < 8 && !tree_round) {
                 ++df2_tree_rej;
                 if (df2_alt_div >= 0 && (size_t) a < df2_alt_d.size() && df2_alt_d[(size_t) a] == outv[(size_t) a]) {
                     ++df2_tree_hits;
