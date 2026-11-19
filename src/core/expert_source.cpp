@@ -1650,8 +1650,7 @@ void FileExpertSource::close() {
     role_bytes_.clear();
     role_file_.clear();
     paths_.clear();
-    for (void* h : direct_) close_direct(h);
-    direct_.clear();
+    clear_direct();
     for (void* h : pdirect_) close_direct(h);
     pdirect_.clear();
     {
@@ -2475,22 +2474,50 @@ uint64_t FileExpertSource::expert_bytes() const {
     return total;
 }
 
+void FileExpertSource::clear_direct() {
+#if defined(_WIN32)
+    for (auto& pool : direct_handles_) {
+        for (void* dh : pool) {
+            if (dh != nullptr && dh != INVALID_HANDLE_VALUE) CloseHandle((HANDLE) dh);
+        }
+    }
+    direct_handles_.clear();
+#else
+    for (void* d : direct_) close_direct(d);
+#endif
+    direct_.clear();
+}
+
 bool FileExpertSource::open_direct(std::string& why) {
 #if defined(_WIN32)
+    clear_direct();
+    const int n_handles = [] {
+        const char* v = std::getenv("STRATA_DIRECT_HANDLES");
+        int n = v ? std::atoi(v) : 8;
+        return std::clamp(n, 1, 32);
+    }();
     for (const std::string& path : paths_) {
         const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
         std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
         if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
-        HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
-            why += "; cannot open " + path + " unbuffered (error " + std::to_string((unsigned long long) GetLastError()) +
-                   "), read through the file cache";
-            for (void* d : direct_) CloseHandle((HANDLE) d);
-            direct_.clear();
-            return false;
+        std::vector<void*> h_pool;
+        for (int i = 0; i < n_handles; ++i) {
+            HANDLE h = CreateFileW(w.data(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                if (i == 0) {
+                    why += "; cannot open " + path + " unbuffered (error " + std::to_string((unsigned long long) GetLastError()) +
+                           "), read through the file cache";
+                    clear_direct();
+                    return false;
+                }
+                break;
+            }
+            h_pool.push_back((void*) h);
         }
-        direct_.push_back(h);
+        direct_.push_back(h_pool.front());
+        direct_handles_.push_back(std::move(h_pool));
     }
     if (role_ptr_.empty()) {   // experts.bin: blob() now assembles into the stage buffers, sized for the largest blob
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -2585,8 +2612,7 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
     if (ub == !direct_.empty()) return ub;
     if (ub) return open_direct(why);
     // through the file cache after all: the mapped reads take over (staged() stays true for the GGUF in place)
-    for (void* d : direct_) close_direct(d);
-    direct_.clear();
+    clear_direct();
     return false;
 #else
     why = "through the file cache (no unbuffered reads on this platform)";
@@ -2727,8 +2753,7 @@ bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
             return true;
         }
         fail = "an unbuffered read of the first blob failed or differed from the mapping";
-        for (void* d : direct_) close_direct(d);
-        direct_.clear();
+        clear_direct();
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_blob_ = 0;
     }
@@ -2749,8 +2774,7 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
         why += ": the file tier reads it unbuffered";
         return false;   // as after drop_mapping: every read goes through read_direct
     }
-    for (void* d : direct_) close_direct(d);
-    direct_.clear();
+    clear_direct();
     {   // the mapped tier hands out the mapping: the startup's stage buffers go
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
@@ -2869,7 +2893,15 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
+        HANDLE h = (HANDLE) direct_[(size_t) x.file];
+        if (!direct_handles_.empty() && (size_t) x.file < direct_handles_.size()) {
+            const auto& pool = direct_handles_[(size_t) x.file];
+            if (!pool.empty()) {
+                const uint64_t rr = direct_rr_.fetch_add(1, std::memory_order_relaxed);
+                h = (HANDLE) pool[(size_t) (rr % pool.size())];
+            }
+        }
+        sc.req.push_back({h, x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2896,6 +2928,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         o.Offset = (DWORD) r.a0;
         o.OffsetHigh = (DWORD) (r.a0 >> 32);
         o.hEvent = sc.ev[q];
+        ResetEvent(sc.ev[q]);
         if (!ReadFile(r.h, sc.buf + r.pos, (DWORD) r.size, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
             ok = false;
             break;

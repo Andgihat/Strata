@@ -3,6 +3,7 @@
 #include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -80,6 +81,8 @@ struct Req {
 
 struct DirectFile::Impl {
     HANDLE file = INVALID_HANDLE_VALUE;
+    std::vector<HANDLE> files;
+    std::atomic<size_t> file_rr{0};
     HANDLE port = nullptr;
     uint64_t size = 0;
     std::mutex mu;                      // everything below
@@ -112,7 +115,12 @@ struct DirectFile::Impl {
         r->ov.Offset = (DWORD) (p.offset & 0xFFFFFFFFull);
         r->ov.OffsetHigh = (DWORD) (p.offset >> 32);
         r->tag = p.tag;
-        if (!ReadFile(file, p.buffer, p.length, nullptr, &r->ov)) {
+        HANDLE h = file;
+        if (!files.empty()) {
+            const size_t idx = file_rr.fetch_add(1, std::memory_order_relaxed);
+            h = files[idx % files.size()];
+        }
+        if (!ReadFile(h, p.buffer, p.length, nullptr, &r->ov)) {
             const DWORD e = GetLastError();
             if (e != ERROR_IO_PENDING) {
                 std::lock_guard<std::mutex> lk(mu);
@@ -163,12 +171,32 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
     // NO_BUFFERING: the cache manager never holds these pages, so the table cannot grow into RAM.
     // RANDOM_ACCESS: no read-ahead. OVERLAPPED: many reads in flight, completed through the port below.
-    impl_->file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                              FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
-    if (impl_->file == INVALID_HANDLE_VALUE) {
-        err = "DirectFile: cannot open " + path + " (error " + std::to_string(GetLastError()) + ")";
-        return false;
+    const int n = io_threads(4);
+    for (int i = 0; i < n; ++i) {
+        HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (i == 0) {
+                err = "DirectFile: cannot open " + path + " (error " + std::to_string(GetLastError()) + ")";
+                return false;
+            }
+            break;
+        }
+        if (impl_->port == nullptr) {
+            impl_->port = CreateIoCompletionPort(h, nullptr, (ULONG_PTR) i, 1);
+            if (impl_->port == nullptr) {
+                err = "DirectFile: CreateIoCompletionPort failed (error " + std::to_string(GetLastError()) + ")";
+                CloseHandle(h);
+                close();
+                return false;
+            }
+        } else {
+            CreateIoCompletionPort(h, impl_->port, (ULONG_PTR) i, 1);
+        }
+        impl_->files.push_back(h);
     }
+    impl_->file = impl_->files.empty() ? INVALID_HANDLE_VALUE : impl_->files.front();
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(impl_->file, &sz)) {
         err = "DirectFile: cannot size " + path;
@@ -176,15 +204,8 @@ bool DirectFile::open(const std::string& path, std::string& err) {
         return false;
     }
     impl_->size = (uint64_t) sz.QuadPart;
-    impl_->port = CreateIoCompletionPort(impl_->file, nullptr, 0, 1);
-    if (impl_->port == nullptr) {
-        err = "DirectFile: CreateIoCompletionPort failed (error " + std::to_string(GetLastError()) + ")";
-        close();
-        return false;
-    }
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
     // produces exactly one packet; `wait` is the only completion path.
-    const int n = io_threads(4);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
     return true;
 }
@@ -192,7 +213,8 @@ bool DirectFile::open(const std::string& path, std::string& err) {
 void DirectFile::close() {
     impl_->stop_pool();
     if (impl_->port != nullptr) CloseHandle(impl_->port);
-    if (impl_->file != INVALID_HANDLE_VALUE) CloseHandle(impl_->file);
+    for (HANDLE h : impl_->files) CloseHandle(h);
+    impl_->files.clear();
     impl_->port = nullptr;
     impl_->file = INVALID_HANDLE_VALUE;
     impl_->size = 0;
