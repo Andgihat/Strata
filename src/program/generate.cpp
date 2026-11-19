@@ -8128,9 +8128,10 @@ int main(int argc, char** argv) {
         // #773: without a RAM budget there is no RAM copy and the file cache IS the expert tier (measured on a
         // 32 GB, 2 x 16 GB rig: forcing unbuffered reads there re-read 163-629 GB from the drive and halved the
         // speed), so STRATA_UNBUFFERED_LOAD=1 is not honoured in that mode
-        if (o.resident_budget > 0) {
+        if (o.resident_budget > 0 || o.resident_cpu_experts) {
             std::string why;
-            const bool ub = src.set_unbuffered(o.resident_budget, why);
+            const uint64_t ram_bytes = (uint64_t) (o.resident_budget * 1073741824.0);
+            const bool ub = src.set_unbuffered(ram_bytes, why);
             std::fprintf(stderr, "strata generate: the file tier reads %s (%s)\n",
                          ub ? "unbuffered" : "through the file cache", why.c_str());
         } else if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0' &&
@@ -11397,7 +11398,7 @@ int main(int argc, char** argv) {
         // the file cache keeps those, and every refill after a prompt read the drive instead).  Windows and Linux: the
         // unbuffered reads exist there
 #if defined(_WIN32) || defined(__linux__)
-        if (o.mmap_experts && o.resident_budget > 0 && !startup_kept) {
+        if (o.mmap_experts && (o.resident_budget > 0 || o.resident_cpu_experts) && !startup_kept) {
             std::string why;
             const bool was = src.unbuffered();
             const bool ub = src.recheck_unbuffered(why);
