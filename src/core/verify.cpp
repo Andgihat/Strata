@@ -3348,7 +3348,7 @@ bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
             announced = true;
         }
         strata_cpu_pause();
-        if ((++spins & 1023u) != 0) continue;
+        if ((++spins & 32767u) != 0) continue;
         if (Clock::now() - t0 > std::chrono::seconds(20)) {
             // the release drains the window's own streams, never the tier's copy stream: say so, and hand out the
             // gate's words and this window's GPU breadcrumbs (STRATA_VERIFY_TRACE) - the last landed layer is the
@@ -3628,7 +3628,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         progress_at("verify window: waiting for the GPU to reach layer", l);
         while (*seq < want) {
             strata_cpu_pause();
-            if ((++spins & 1023u) != 0) continue;
+            if ((++spins & 32767u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
@@ -5122,7 +5122,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         progress_at("verify batch: waiting for the GPU to reach layer", l);
         while (*seq < want) {
             strata_cpu_pause();
-            if ((++spins & 1023u) != 0) continue;
+            if ((++spins & 32767u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;

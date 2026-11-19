@@ -1149,6 +1149,7 @@ struct Options {
     std::string draft_fallback;
     double draft_conf = 0.0;   ///< --draft-conf P: with --draft dflash2 the window ends where the product of the selector's probabilities falls below P (replaces --spec-min-p)
     bool caddtree = false;     ///< --caddtree: enable CaDDTree active tree verification (default: false, linear DFlash2 mode)
+    bool spec_v2 = true;       ///< --spec-v2: Spec V2 / Overlap Scheduling pipeline (default: true)
     /// --draft auto (serve): both drafters stay current and each request picks one (its key draft=mtp|dflash2, else draft_rule); the CLI treats auto as dflash2
     bool draft_auto = false;
     std::string draft_rule = "df2";   ///< --draft-rule df2|mtp|learn: what a request without a draft= key gets
@@ -1323,6 +1324,8 @@ void usage() {
                  "  --draft-conf P       with --draft dflash2: end the window where the product of the selector's probabilities falls below P (default 0 = --spec-min-p)\n"
                  "  --caddtree           enable CaDDTree active tree verification (default: off, linear DFlash2 mode)\n"
                  "  --no-caddtree        disable CaDDTree active tree verification (default)\n"
+                 "  --spec-v2            enable Spec V2 / overlap scheduling pipeline (default: on)\n"
+                 "  --no-spec-v2         disable Spec V2 / overlap scheduling pipeline (sequential mode)\n"
                  "  --draft auto         (serve) both drafters stay current; a request picks one: draft=mtp|dflash2, else --draft-rule df2|mtp|learn;\n"
                  "                       MTP requests use --draft-mtp-spec N (default 4) and --draft-mtp-min-p P\n"
                  "  --draft-cap N        the widest verify window with --draft dflash2 (default by card: 8 on Strix Halo / iGPU and on Blackwell cc 12.0 with 48 GB or more, 6 on other Blackwell, --spec as given elsewhere)\n"
@@ -3969,6 +3972,8 @@ int main(int argc, char** argv) {
         else if (a == "--draft-conf") o.draft_conf = std::clamp(std::atof(next("--draft-conf")), 0.0, 1.0);
         else if (a == "--caddtree") o.caddtree = true;
         else if (a == "--no-caddtree") o.caddtree = false;
+        else if (a == "--spec-v2") o.spec_v2 = true;
+        else if (a == "--no-spec-v2") o.spec_v2 = false;
         else if (a == "--draft-cap") o.draft_cap = std::max(0, std::atoi(next("--draft-cap")));
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
         else if (a == "--control-vector-scaled") {
@@ -4218,6 +4223,15 @@ int main(int argc, char** argv) {
         else if (*e == '0' || *e == 'n' || *e == 'N' || *e == 'f' || *e == 'F') o.caddtree = false;
     }
     if (std::getenv("STRATA_DISABLE_CADDTREE") != nullptr) o.caddtree = false;
+    if (const char* e = std::getenv("STRATA_ENABLE_SPEC_V2")) {
+        if (*e == '1' || *e == 'y' || *e == 'Y' || *e == 't' || *e == 'T') o.spec_v2 = true;
+        else if (*e == '0' || *e == 'n' || *e == 'N' || *e == 'f' || *e == 'F') o.spec_v2 = false;
+    }
+    if (const char* e = std::getenv("STRATA_SPEC_V2")) {
+        if (*e == '1' || *e == 'y' || *e == 'Y' || *e == 't' || *e == 'T') o.spec_v2 = true;
+        else if (*e == '0' || *e == 'n' || *e == 'N' || *e == 'f' || *e == 'F') o.spec_v2 = false;
+    }
+    if (std::getenv("STRATA_DISABLE_SPEC_V2") != nullptr) o.spec_v2 = false;
     if (!o.prefill_cap_warn.empty() && !o.prefill_cap_warn_skip)
         std::fprintf(stderr, "strata: WARNING --prefill %s: prompt chunks of 8192 tokens or more crashed the engine "
                              "on Windows HIP (RX 7900 XTX: the commit charge jumped ~70 GB, exit code 0xC0000409, "
@@ -22601,57 +22615,85 @@ int main(int argc, char** argv) {
         std::vector<int32_t> df2_alt_d(strata::core::Dflash2Drafter::kDrafts, -1);
         int df2_alt_div = -1;
         int df2_tree_hits = 0, df2_tree_rej = 0;
-        // the next round's drafts after a commit: the MTP chain, or the DFlash2 block from the committed rows' taps
-        auto draft_next = [&](int T_, int a_) -> bool {
+        double ms_df2_hidden_total = 0.0;
+        double ms_df2_wait_total = 0.0;
+        bool df2_in_flight = false;
+        Clock::time_point t_df2_launch{};
+
+        auto draft_next_launch = [&](int T_, int a_) -> bool {
 #if defined(STRATA_HAVE_DFLASH2)
             if (use_df2) {
-                if (o.suffix_draft > 0 && !first_window) {   // a long suffix match: no draft now (spec/window_rule.hpp skip_draft_for_lookup); the next round decides
+                if (o.suffix_draft > 0 && !first_window) {
                     const int ks = sfx.propose(o.spec - 1, sbuf.data());
                     if (strata::spec::skip_draft_for_lookup(true, df2_skip_min, ks, sfx.last_match())) {
                         df2_deferred = true; dfr_n = a_ + 1; dfr_pos = p; dfr_anchor = outv[(size_t) a_];
                         return true;
                     }
                 }
-                static const bool wait_commit_first = std::getenv("STRATA_DF2_WAITCOMMIT") != nullptr;   // measurement: no overlap with the async commit
+                static const bool wait_commit_first = std::getenv("STRATA_DF2_WAITCOMMIT") != nullptr;
                 if (wait_commit_first && !ver.wait_commit(err)) return false;
-                int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                float pp[strata::core::Dflash2Drafter::kDrafts];
-                int32_t alt_dd[strata::core::Dflash2Drafter::kDrafts];
-                int alt_div = -1;
-                if (!df2.draft(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err, alt_dd, &alt_div)) return false;
-                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
-                    drafts[i] = dd[i];
-                    dprob[i] = pp[i];
-                    df2_alt_d[i] = alt_dd[i];
-                }
-                df2_alt_div = alt_div;
-                // what the MTP does while it drafts: the PLE rows of the tokens the next window will hold are read ahead
-                // (the window's gather would otherwise wait for them: 1.8 ms a round on strix)
-                if (ss.ple.ready() && ss.ple.table != nullptr) {
-                    int n_pf = 0;
-                    const int cap = std::min<int>(S_mtp, (int) drafts.size() + 1);
-                    double chain = 1.0;
-                    for (int t = 1; t < cap; ++t) {
-                        if (o.draft_conf > 0.0) { if ((chain *= (double) dprob[(size_t) t - 1]) < o.draft_conf) break; }
-                        else if (o.spec_min_p > 0.0 && dprob[(size_t) t - 1] < (float) o.spec_min_p) break;
-                        ++n_pf;
-                    }
-                    int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-                    auto pf = [&](int32_t tok) {
-                        uint32_t rows16[strata::kernels::PLE_N_HEADS];
-                        strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts, rows16);
-                        prev[0] = prev[1];
-                        prev[1] = tok;
-                        ss.ple.table->prefetch_rows(rows16);
-                    };
-                    pf(outv[(size_t) a_]);
-                    for (int i = 0; i < n_pf; ++i) pf(drafts[(size_t) i]);
-                }
+                if (!df2.draft_launch(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], err)) return false;
+                df2_in_flight = true;
+                t_df2_launch = Clock::now();
                 return true;
+            }
+#endif
+            return true;
+        };
+
+        auto draft_next_finish = [&](int T_, int a_) -> bool {
+#if defined(STRATA_HAVE_DFLASH2)
+            if (use_df2) {
+                if (df2_deferred) return true;
+                if (df2_in_flight) {
+                    df2_in_flight = false;
+                    const Clock::time_point tw0 = Clock::now();
+                    int32_t dd[strata::core::Dflash2Drafter::kDrafts];
+                    float pp[strata::core::Dflash2Drafter::kDrafts];
+                    int32_t alt_dd[strata::core::Dflash2Drafter::kDrafts];
+                    int alt_div = -1;
+                    if (!df2.draft_finish(dd, pp, err, alt_dd, &alt_div)) return false;
+                    const double ms_wait = std::chrono::duration<double, std::milli>(Clock::now() - tw0).count();
+                    const double ms_total = std::chrono::duration<double, std::milli>(Clock::now() - t_df2_launch).count();
+                    ms_df2_wait_total += ms_wait;
+                    ms_df2_hidden_total += std::max(0.0, ms_total - ms_wait);
+                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                        drafts[i] = dd[i];
+                        dprob[i] = pp[i];
+                        df2_alt_d[i] = alt_dd[i];
+                    }
+                    df2_alt_div = alt_div;
+                    if (ss.ple.ready() && ss.ple.table != nullptr) {
+                        int n_pf = 0;
+                        const int cap = std::min<int>(S_mtp, (int) drafts.size() + 1);
+                        double chain = 1.0;
+                        for (int t = 1; t < cap; ++t) {
+                            if (o.draft_conf > 0.0) { if ((chain *= (double) dprob[(size_t) t - 1]) < o.draft_conf) break; }
+                            else if (o.spec_min_p > 0.0 && dprob[(size_t) t - 1] < (float) o.spec_min_p) break;
+                            ++n_pf;
+                        }
+                        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+                        auto pf = [&](int32_t tok) {
+                            uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                            strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts, rows16);
+                            prev[0] = prev[1];
+                            prev[1] = tok;
+                            ss.ple.table->prefetch_rows(rows16);
+                        };
+                        for (int i = 0; i < n_pf; ++i) pf(drafts[(size_t) i]);
+                    }
+                    return true;
+                }
             }
 #endif
             return mtp.draft_long(T_, outv.data(), p, a_, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
                                   nullptr, gated_proposal ? &generation : nullptr);
+        };
+
+        // the next round's drafts after a commit: the MTP chain, or the DFlash2 block from the committed rows' taps
+        auto draft_next = [&](int T_, int a_) -> bool {
+            if (!draft_next_launch(T_, a_)) return false;
+            return draft_next_finish(T_, a_);
         };
         int win_cap = o.spec;   // the widest window the VRAM allows (lowered on an out-of-memory capture, see below)
         while ((int64_t) produced.size() < max_new) {
@@ -22688,6 +22730,19 @@ int main(int argc, char** argv) {
             policy.set_context(p);
             bool from_sfx = false;
             int sfx_match = 0;
+            if (adapt_nowait()) apply_pending(false);
+            else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+            int sfx_k = 0;
+            if (o.suffix_draft > 0 && !first_window) {
+                sfx_k = sfx.propose(o.spec - 1, sbuf.data());
+                sfx_match = sfx.last_match();
+            }
+            if (df2_in_flight) {
+                if (!draft_next_finish(0, 0)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+            }
             if (gated_proposal) {
                 source_policy.apply_costs(p);   // held round times whose draws are all committed now
                 if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0, first_window,
@@ -22710,15 +22765,13 @@ int main(int argc, char** argv) {
             if (first_window) T = 1;
             std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());
             if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
-            if (o.suffix_draft > 0 && !first_window) {
-                const int k = sfx.propose(o.spec - 1, sbuf.data());
-                sfx_match = sfx.last_match();
+            if (sfx_k > 0) {
                 // a probabilistic window must not condition the source on the draw: the policy copy fixed at the start chooses, and the
                 // lookup is taken without asking whether the MTP's first guess agrees
                 const bool probabilistic = use_mtp && !spec_uses_df2 && mtp.prob();   // DFlash2's candidates are not draws from the MTP's q
-                if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0])) {
+                if (probabilistic || !draft_on || sbuf[0] == drafts[0]) {
                     const strata::spec::DraftPolicy::Pick pk = probabilistic
-                        ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
+                        ? source_policy.choose(S_mtp, sfx_k, sfx_match) : policy.choose(T, sfx_k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
@@ -22949,15 +23002,25 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
+            const bool will_draft = draft_on && ((int64_t) produced.size() < max_new);
+            if (o.spec_v2 && use_df2 && will_draft) {
+                if (!draft_next_launch(T, a)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+            }
             generation = {};
             const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-            const bool drafted = !draft_on || (int64_t) produced.size() >= max_new || draft_next(T, a);
+            if (!o.spec_v2 || !use_df2 || !df2_in_flight) {
+                const bool drafted = !draft_on || (int64_t) produced.size() >= max_new || draft_next(T, a);
+                if (!drafted) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+            }
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
-            if (!drafted) {
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                return 1;
-            }
             x = outv[(size_t) a];
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -22980,6 +23043,9 @@ int main(int argc, char** argv) {
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
+        }
+        if (df2_in_flight) {
+            (void) draft_next_finish(0, 0);
         }
         // the last commit (set_commit_async) before anything reads the session again
         if (!ver.wait_commit(err)) {
@@ -23111,6 +23177,10 @@ int main(int argc, char** argv) {
             } else {
                 std::printf("%-24s %.3f ms/round drafting (%lld rounds, GPU %.3f), %.0f MiB of VRAM\n", "dflash2", df2.ms_draft / (double) df2.rounds,
                             (long long) df2.rounds, df2.ms_gpu / (double) df2.rounds, (double) df2.vram_bytes() / 1048576.0);
+            }
+            if (o.spec_v2) {
+                std::printf("%-24s spec v2 overlap: %.3f ms hidden behind host/commit, %.3f ms wait per round\n",
+                            "spec v2", ms_df2_hidden_total / (double) df2.rounds, ms_df2_wait_total / (double) df2.rounds);
             }
         } else
 #endif

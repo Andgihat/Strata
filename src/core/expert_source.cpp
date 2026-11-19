@@ -3330,6 +3330,7 @@ void RouterLookahead::run() {
         const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
         std::vector<uint64_t> sm;
         if (stats_on_) sm.assign((size_t) (3 * words_), 0);
+        int vote_weight[512] = {};
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
@@ -3345,6 +3346,9 @@ void RouterLookahead::run() {
                     const float c = (float) (k_ - j) / (float) k_ * (dj == 0 ? 1.0f : std::pow(0.5f, (float) dj));
                     if (it == want.end()) { want.push_back(e); wconf.push_back(c); }
                     else if (scored && c > wconf[(size_t) (it - want.begin())]) wconf[(size_t) (it - want.begin())] = c;
+                    if (stats_on_ && dj == 0 && (size_t) e < 512) {
+                        vote_weight[e] += 64 - j;
+                    }
                 }
                 if (stats_on_ && dj == 0)
                     for (int s = 0; s < 3; ++s)
@@ -3352,20 +3356,9 @@ void RouterLookahead::run() {
             }
         }
         if (stats_on_ && dj == 0) {
-            // votes: how many tokens put each non-resident expert in their top k_
-            std::vector<std::pair<int, int32_t>> votes;   // (sum of 64 - rank, expert)
-            for (int64_t t = 0; t < nt; ++t) {
-                const float* lt = logits.data() + (size_t) (t * n_expert_);
-                for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
-                std::partial_sort(order.begin(), order.begin() + k_, order.end(),
-                                  [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
-                for (int j = 0; j < k_; ++j) {
-                    const int32_t e = order[(size_t) j];
-                    if (host_res != nullptr && host_res[(size_t) ((layer - layer0) * n_expert_ + e)] >= 0) continue;
-                    auto it = std::find_if(votes.begin(), votes.end(), [&](const auto& v) { return v.second == e; });
-                    if (it == votes.end()) votes.emplace_back(64 - j, e);
-                    else it->first += 64 - j;
-                }
+            std::vector<std::pair<int, int32_t>> votes;
+            for (int32_t e = 0; e < (int32_t) std::min<int64_t>(512, n_expert_); ++e) {
+                if (vote_weight[e] > 0) votes.emplace_back(vote_weight[e], e);
             }
             std::sort(votes.begin(), votes.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             for (int i = 0; i < kVoteN; ++i)
@@ -6793,7 +6786,7 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     }
     auto* f = new ForesightSwap();
     auto env_int = [](const char* name, int def, int lo) { const char* e = std::getenv(name); const int x = e ? std::atoi(e) : def; return x < lo ? lo : x; };
-    f->budget = env_int("STRATA_FS_BUDGET", 32, 1);
+    f->budget = env_int("STRATA_FS_BUDGET", 128, 1);
     f->admit = env_int("STRATA_FS_ADMIT", 1, 1);
     const int def_depth = (std::getenv("STRATA_PIPELINE_WINDOWS") && std::atoi(std::getenv("STRATA_PIPELINE_WINDOWS")) > 1) ? 4 : 1;
     f->depth = env_int("STRATA_FS_DEPTH", def_depth, 1);
