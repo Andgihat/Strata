@@ -74,6 +74,16 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream);
+/// CaDDTree: copy conv history after root token into branch conv buffer
+void gdn_conv_branch_hist(const float* conv, const float* qkv, float* dst, int channels, void* stream);
+/// CaDDTree: replay root token on initial GDN state to derive branch state
+void gdn_step_replay_one(const float* state_src, const float* hbuf, int conv_channels,
+                         const float* gate, const float* beta, int h_k, int h_v,
+                         float* state_dst, void* stream);
+/// CaDDTree: copy verified branch activations to rows 1..B_keep before calling commit(1 + B_keep)
+void copy_branch_activations(float* qkv_L, float* h_L, float* gate_L, float* beta_L, float* idx_raw_L,
+                             float* hist_snap, int n_gdn, int n_qsa, int C, int HV, int ID, int HS,
+                             int MT, int T_prim, int B_keep, void* stream);
 /// (xq_out, S26 STRATA_QFUSE: also write the q8_1 image of output rows [t_out_begin, n_tok) there - the bytes
 /// native_quantize_q8_1(y + t_out_begin * value_dim, xq_out, value_dim, n_tok - t_out_begin) would write.)
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
