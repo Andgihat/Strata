@@ -246,12 +246,15 @@ void rows_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t row
     }
 }
 
-// The pair layout (types 147-149): AVX2 and AVX-512 both take the AVX2 pair kernel; scalar, and any build without the
-// x86 units (arm64: the Metal build), the scalar one.
+// The pair layout (types 147-149): AVX-512 F/BW/VL/VNNI, AVX2, or scalar reference.
 void rows_pair_on(TqIsa isa, int kb, const uint8_t* w, size_t row_bytes, int n, const tq_detail::TqAct* const* a, int nt,
                   float* const* out, int r0, int r1) {
 #if defined(STRATA_TQ_X86)
-    if (isa != TqIsa::scalar) {
+    if (isa == TqIsa::avx512) {
+        tq_detail::tq_rows_avx512_tqp(kb, w, row_bytes, n, a, nt, out, r0, r1);
+        return;
+    }
+    if (isa == TqIsa::avx2) {
         tq_detail::tq_rows_avx2_tqp(kb, w, row_bytes, n, a, nt, out, r0, r1);
         return;
     }

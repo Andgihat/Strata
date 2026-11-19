@@ -15,6 +15,7 @@
 
 #include "tq_states.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -218,6 +219,44 @@ void check_type(int type, bool reference) {
     }
 }
 
+void bench_type(int type, int rows, int n, int iters) {
+    if (!tq_isa_ok(TqIsa::avx2) || !tq_isa_ok(TqIsa::avx512)) return;
+    Case c(type, rows, n, 4242u + (uint32_t)type);
+    std::vector<float> got;
+
+    for (int nt : {1, 4, 8}) {
+        // Warmup
+        for (int i = 0; i < 20; ++i) {
+            c.run(TqIsa::avx2, nt, c.ap, got);
+            c.run(TqIsa::avx512, nt, c.ap, got);
+        }
+
+        // AVX2 timing
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            c.run(TqIsa::avx2, nt, c.ap, got);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms_avx2 = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // AVX-512 timing
+        auto t2 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            c.run(TqIsa::avx512, nt, c.ap, got);
+        }
+        auto t3 = std::chrono::high_resolution_clock::now();
+        double ms_avx512 = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+        double gflops = (2.0 * rows * n * nt * iters) / 1e9;
+        double gflops_avx2 = gflops / (ms_avx2 / 1000.0);
+        double gflops_avx512 = gflops / (ms_avx512 / 1000.0);
+        double speedup = ms_avx2 / ms_avx512;
+
+        std::printf("  Type %d | tokens %d | AVX2: %6.2f ms (%5.1f GFLOPS) | AVX512: %6.2f ms (%5.1f GFLOPS) | Speedup: %4.2fx\n",
+                    type, nt, ms_avx2, gflops_avx2, ms_avx512, gflops_avx512, speedup);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -225,5 +264,12 @@ int main() {
     for (int type : {147, 148, 149}) check_type(type, true);
     for (int type : {144, 145, 146}) check_type(type, false);
     std::printf("tqp_cpu_test: %d failures\n", g_fail);
+
+    if (g_fail == 0) {
+        std::printf("\n=== Micro-benchmark: AVX2 vs AVX-512 VNNI (rows=256, n=2048, 200 iters) ===\n");
+        for (int type : {147, 148, 149}) {
+            bench_type(type, 256, 2048, 200);
+        }
+    }
     return g_fail ? 1 : 0;
 }

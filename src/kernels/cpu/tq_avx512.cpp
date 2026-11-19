@@ -94,4 +94,71 @@ void tq_rows_avx512(int kb, const int16_t* table, const uint8_t* w, size_t row_b
     else rows_t<7>(table, w, row_bytes, n, a, nt, out, r0, r1);
 }
 
+// TQP (147-149): 64 pair-steps per 128-value block on AVX-512 F/BW/VL/VNNI.
+// 16 states make one ZMM of 32 int16 weights (pairs16), and the 4 groups (each one ZMM)
+// dot against four ZMM of int16 activations via VPDPWSSD.
+inline __m256i pairs8(const int16_t* tab, uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3, uint32_t s4,
+                      uint32_t s5, uint32_t s6, uint32_t s7) {
+    const __m128i a0 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s0)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s1)));
+    const __m128i a1 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s2)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s3)));
+    const __m128i a2 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s4)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s5)));
+    const __m128i a3 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s6)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s7)));
+    return _mm256_set_m128i(_mm_unpacklo_epi64(a2, a3), _mm_unpacklo_epi64(a0, a1));
+}
+
+inline __m512i pairs16(const int16_t* tab, const uint32_t* s) {
+    const __m256i lo = pairs8(tab, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+    const __m256i hi = pairs8(tab, s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]);
+    return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+}
+
+template <int KB>
+void rows_tqp_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                int r1) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 2 + 8 * KB;
+    const int16_t* tab = tq_state_table();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        __m128 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * bsz;
+            uint32_t st[64];
+            tq_states_tqp<KB>(blk + 2, st);
+            const __m512i w0 = pairs16(tab, st + 0);
+            const __m512i w1 = pairs16(tab, st + 16);
+            const __m512i w2 = pairs16(tab, st + 32);
+            const __m512i w3 = pairs16(tab, st + 48);
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
+            for (int t = 0; t < nt; ++t) {
+                const __m512i* q = (const __m512i*) (a[t]->q + 128 * i);
+                const __m512i z = _mm512_setzero_si512();
+                const __m128i s = reduce4(_mm512_dpwssd_epi32(z, w0, _mm512_load_si512(q + 0)),
+                                          _mm512_dpwssd_epi32(z, w1, _mm512_load_si512(q + 1)),
+                                          _mm512_dpwssd_epi32(z, w2, _mm512_load_si512(q + 2)),
+                                          _mm512_dpwssd_epi32(z, w3, _mm512_load_si512(q + 3)));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = ((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f);
+        }
+    }
+}
+
+void tq_rows_avx512_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                        float* const* out, int r0, int r1) {
+    if (kb == 5) rows_tqp_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
+    else if (kb == 6) rows_tqp_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
+    else rows_tqp_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
+}
+
 }  // namespace strata::kernels::cpu::tq_detail
